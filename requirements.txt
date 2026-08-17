@@ -1,0 +1,39 @@
+# PhoWhisper-large x ViMD - Vietnamese multi-dialect ASR fine-tuning
+#
+# Target environment: Linux x86_64, Python 3.10-3.12, NVIDIA driver reporting
+# CUDA 12.2, one ~80 GB GPU. Install with:
+#
+#     pip install -r requirements.txt
+#
+# torch is pinned to the cu121 build so it matches the server's CUDA 12.2 driver
+# exactly. If download.pytorch.org is unreachable from the lab network, the PyPI
+# wheel works too (`pip install torch==2.5.1`): it is a cu124 build and CUDA 12
+# minor-version compatibility covers a 12.2 driver.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+
+# transformers is deliberately held below 4.52. From 4.52 onwards it refuses to
+# torch.load a pytorch_model.bin unless torch >= 2.6, and vinai/PhoWhisper-large
+# publishes its 6.17 GB fp32 weights only in .bin form - no safetensors. main.py
+# also carries a runtime .bin -> safetensors fallback, but this pin avoids the
+# whole detour.
+transformers==4.51.3
+accelerate==1.6.0
+tokenizers==0.21.1
+huggingface_hub==0.30.2
+safetensors==0.5.3
+
+# Dataset preparation: raw parquet reading, WAV decoding, 44.1 kHz -> 16 kHz
+# polyphase resampling. The `datasets` library is intentionally NOT used, so the
+# pipeline does not depend on its Audio decoding backend (soundfile in 3.x,
+# torchcodec in 4.x).
+pyarrow==19.0.1
+soundfile==0.13.1
+numpy==1.26.4; python_version < "3.13"
+numpy==2.1.3; python_version >= "3.13"
+scipy==1.13.1; python_version < "3.13"
+scipy==1.15.2; python_version >= "3.13"
+
+# WER / CER. jiwer is called directly rather than through `evaluate`, which would
+# download a metric script from the Hub in the middle of training.
+jiwer==3.1.0
