@@ -78,7 +78,6 @@ from transformers import (
     WhisperFeatureExtractor,
     WhisperForConditionalGeneration,
     WhisperProcessor,
-    WhisperTokenizerFast,
     set_seed,
 )
 
@@ -1263,14 +1262,28 @@ def _dataloader_worker_init(_worker_id: int) -> None:
 # 6. Model
 # ===========================================================================
 
-def resolve_model_snapshot(cfg: Config) -> Tuple[Path, str]:
+# Everything the model and processor need; skips only docs and images.
+MODEL_FILE_PATTERNS: Tuple[str, ...] = ("*.json", "*.txt", "*.bin", "*.safetensors", "*.model")
+# The tokenizer, feature extractor and configs on their own - a few megabytes rather than
+# 6.2 GB. Fetching just these makes the processor cheap enough to build and check before
+# the data stage instead of after it.
+PROCESSOR_FILE_PATTERNS: Tuple[str, ...] = ("*.json", "*.txt")
+
+
+def resolve_model_snapshot(
+    cfg: Config, allow_patterns: Sequence[str] = MODEL_FILE_PATTERNS
+) -> Tuple[Path, str]:
     """Download the pretrained model once, at a pinned revision, with retries.
 
     Two problems solved together. The 6.2 GB download previously happened inside a bare
     from_pretrained call, so a network interruption killed the run outright rather than
     being retried like the dataset shards. And the revision was never pinned, so an
     upstream PhoWhisper push between restarts could change the weights or the tokenizer
-    without the recipe guard noticing."""
+    without the recipe guard noticing.
+
+    `allow_patterns` narrows what is fetched. Calling this twice is deliberate and cheap:
+    snapshot_download is incremental, and the second call reads the revision back from
+    the pin file rather than asking the Hub again."""
     from huggingface_hub import HfApi, snapshot_download
 
     pin_path = cfg.output_dir / "model_revision.json"
@@ -1293,8 +1306,7 @@ def resolve_model_snapshot(cfg: Config) -> Tuple[Path, str]:
             lambda: snapshot_download(
                 cfg.model_id,
                 revision=revision,
-                # Everything the model and processor need; skips only docs and images.
-                allow_patterns=["*.json", "*.txt", "*.bin", "*.safetensors", "*.model"],
+                allow_patterns=list(allow_patterns),
             ),
             f"downloading {cfg.model_id}@{revision}",
             cfg.download_retries,
@@ -1307,12 +1319,170 @@ def resolve_model_snapshot(cfg: Config) -> Tuple[Path, str]:
     return local, revision
 
 
+def _processor_tokenizer_classes() -> List[type]:
+    """The tokenizer classes the installed WhisperProcessor will actually accept.
+
+    ProcessorMixin.__init__ isinstance-checks each argument against whatever
+    WhisperProcessor declares in `tokenizer_class`, and that declaration moved between
+    releases. Every version up to and including 4.53 declares the plain string
+    "WhisperTokenizer", so handing it a WhisperTokenizerFast - which descends from
+    PreTrainedTokenizerFast, not from WhisperTokenizer - always raises
+    `Received a WhisperTokenizerFast for argument tokenizer, but a WhisperTokenizer was
+    expected`. From 4.56 the declaration is the tuple ("WhisperTokenizer",
+    "WhisperTokenizerFast") and both are allowed. Asking the class what it accepts,
+    rather than naming a tokenizer here, is what survives that change and the next one.
+
+    The declared order is kept, so the slow tokenizer wins wherever both are allowed: it
+    is the one class every version accepts, which keeps the label ids identical across
+    upgrades. Nothing here is tokenizer-bound - one cached pass over the corpus in
+    _label_lengths, a handful of short strings per batch in the collator, and
+    batch_decode at evaluation - so the fast tokenizer buys no measurable wall-clock."""
+    declared = getattr(WhisperProcessor, "tokenizer_class", "WhisperTokenizer")
+    names = list(declared) if isinstance(declared, (tuple, list)) else [declared]
+    classes: List[type] = []
+    for name in names:
+        candidate = getattr(transformers, name, None) if isinstance(name, str) else name
+        if isinstance(candidate, type) and candidate not in classes:
+            classes.append(candidate)
+    if not classes:
+        raise RuntimeError(
+            f"transformers {transformers.__version__} declares "
+            f"WhisperProcessor.tokenizer_class={declared!r}, none of which resolves to a "
+            f"class in the transformers package. Install the versions pinned in "
+            f"requirements.txt."
+        )
+    return classes
+
+
+# Short, deliberately accented: it exercises the byte-level BPE path that Vietnamese
+# diacritics take through the vocabulary.
+TOKENIZER_PROBE = "xin chào các bạn"
+
+
+def _verify_tokenizer(tokenizer: Any, cfg: Config) -> None:
+    """Prove the tokenizer is the one this recipe assumes, in a millisecond.
+
+    Every training label carries the four-token prefix checked below. A tokenizer that
+    quietly ignored `language=` or `task=` would teach the model the wrong language tag
+    and would only show up days later as a mediocre WER, so it is worth being explicit
+    here. The round-trip and the pad() call exercise exactly what WhisperCollator and
+    make_compute_metrics do with this object."""
+    name = type(tokenizer).__name__
+    if tokenizer.pad_token_id is None:
+        raise RuntimeError(
+            f"{name} loaded from {tokenizer.name_or_path} has no pad token, which the "
+            f"collator needs to build a rectangular batch of labels"
+        )
+
+    unk_id = tokenizer.unk_token_id
+    expected_tokens = [
+        "<|startoftranscript|>",
+        f"<|{cfg.language}|>",
+        f"<|{cfg.task}|>",
+        "<|notimestamps|>",
+    ]
+    expected_ids: List[int] = []
+    for token in expected_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        # Neither class raises on a token it does not know: both hand back the unk id,
+        # which for Whisper is the perfectly valid <|endoftext|>, so compare against it.
+        if token_id is None or (unk_id is not None and token_id == unk_id):
+            raise RuntimeError(
+                f"{name} loaded from {tokenizer.name_or_path} has no {token} token. Either "
+                f"Config.language/Config.task ({cfg.language!r}/{cfg.task!r}) name something "
+                f"this model was not trained for, or the snapshot's vocabulary is not a "
+                f"Whisper one."
+            )
+        expected_ids.append(int(token_id))
+
+    encoded = list(tokenizer([TOKENIZER_PROBE])["input_ids"][0])
+    if encoded[:4] != expected_ids:
+        raise RuntimeError(
+            f"{name} prefixes labels with "
+            f"{tokenizer.convert_ids_to_tokens(encoded[:4])} instead of {expected_tokens}: "
+            f"language={cfg.language!r} and task={cfg.task!r} did not take effect. Training "
+            f"on these labels would tag every utterance wrongly."
+        )
+    decoded = tokenizer.batch_decode([encoded], skip_special_tokens=True)[0].strip()
+    if decoded != TOKENIZER_PROBE:
+        raise RuntimeError(
+            f"{name} does not round-trip Vietnamese text: {TOKENIZER_PROBE!r} came back as "
+            f"{decoded!r}. The vocabulary files in {tokenizer.name_or_path} look wrong."
+        )
+
+    # The exact call WhisperCollator makes on every batch.
+    padded = tokenizer.pad({"input_ids": [encoded, encoded[:2]]}, return_tensors="pt")
+    expected_shape = (2, len(encoded))
+    if tuple(padded["input_ids"].shape) != expected_shape or tuple(
+        padded["attention_mask"].shape
+    ) != expected_shape:
+        raise RuntimeError(
+            f"{name}.pad returned {tuple(padded['input_ids'].shape)} for a batch that should "
+            f"pad to {expected_shape}; the collator cannot build labels from it"
+        )
+
+
 def load_processor(cfg: Config, model_path: Path) -> WhisperProcessor:
+    """Build the processor with a tokenizer this transformers version accepts, and check it.
+
+    Hard-coding WhisperTokenizerFast here is what used to kill the run six hours in, on
+    the pinned transformers 4.51.3, which accepts only the slow class. Every accepted
+    class is now tried in turn and whatever survives is verified before it can reach the
+    trainer."""
     feature_extractor = WhisperFeatureExtractor.from_pretrained(str(model_path))
-    tokenizer = WhisperTokenizerFast.from_pretrained(
-        str(model_path), language=cfg.language, task=cfg.task, predict_timestamps=False
-    )
-    return WhisperProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
+    failures: List[str] = []
+    last_error: Optional[BaseException] = None
+    for tokenizer_class in _processor_tokenizer_classes():
+        try:
+            tokenizer = tokenizer_class.from_pretrained(
+                str(model_path), language=cfg.language, task=cfg.task, predict_timestamps=False
+            )
+            # Not redundant. A fast tokenizer loaded from a tokenizer.json encodes with the
+            # post-processor template baked into that file, so `language=` above sets the
+            # attribute - tokenizer.language really does read "vi" - while every label
+            # still comes out prefixed with whatever was baked, typically a bare
+            # <|startoftranscript|><|notimestamps|>. set_prefix_tokens rewrites the
+            # template; on the slow tokenizer, which builds its prefix on each call, it is
+            # a no-op. Verified against 4.56.2.
+            set_prefix_tokens = getattr(tokenizer, "set_prefix_tokens", None)
+            if callable(set_prefix_tokens):
+                set_prefix_tokens(
+                    language=cfg.language, task=cfg.task, predict_timestamps=False
+                )
+            processor = WhisperProcessor(feature_extractor=feature_extractor, tokenizer=tokenizer)
+        # Deliberately broad. A missing vocab.json alone gets you a TypeError on 4.51.3
+        # that the library then re-raises as an ImportError about protobuf; other versions
+        # and other missing files produce OSError, ValueError, KeyError or a JSON decode
+        # error. There is another candidate to try and every reason is repeated in the
+        # error below, so nothing is swallowed - only postponed.
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"{tokenizer_class.__name__}: {type(exc).__name__}: {exc}")
+            last_error = exc
+            LOGGER.warning(
+                "%s cannot be used here (%s: %s); trying the next tokenizer class",
+                tokenizer_class.__name__, type(exc).__name__, exc,
+            )
+            continue
+        # Deliberately outside the try: a tokenizer that loads but is wrong is a reason to
+        # stop, not a reason to quietly try another class against the same files.
+        _verify_tokenizer(processor.tokenizer, cfg)
+        LOGGER.info(
+            "tokenizer %s (%d tokens), language=%s task=%s, no timestamps",
+            type(processor.tokenizer).__name__, len(processor.tokenizer), cfg.language, cfg.task,
+        )
+        return processor
+    raise RuntimeError(
+        "could not build a WhisperProcessor from {path} with transformers {version}:\n"
+        "  {attempts}\n"
+        "The slow WhisperTokenizer is built from vocab.json and merges.txt, the fast one "
+        "from tokenizer.json, and WhisperProcessor only accepts the fast class from "
+        "transformers 4.56 onwards. Check which of those files the snapshot actually "
+        "contains.".format(
+            path=model_path,
+            version=transformers.__version__,
+            attempts="\n  ".join(failures) or "(no tokenizer class was even attempted)",
+        )
+    ) from last_error
 
 
 def _convert_bin_to_safetensors(cfg: Config, source: Path) -> Path:
@@ -2065,15 +2235,22 @@ def run(cfg: Config) -> int:
 
     set_seed(cfg.seed)
 
+    # The processor is built here rather than beside the weights in stage 2. The files it
+    # needs are a few megabytes and checking it takes a millisecond, but getting it wrong
+    # used to surface only once the six-hour audio conversion had finished. Same bargain
+    # as the CUDA smoke test in preflight: pay a second now, not a night.
+    processor_path, _ = resolve_model_snapshot(cfg, PROCESSOR_FILE_PATTERNS)
+    processor = load_processor(cfg, processor_path)
+    tokenizer = processor.tokenizer
+    feature_extractor = processor.feature_extractor
+
     # ---- stage 1: data --------------------------------------------------
     dataset_revision = prepare_dataset(cfg)
 
     # ---- stage 2: index -------------------------------------------------
-    banner("Stage 2/5 - model download, indexing and tokenizer checks")
+    banner("Stage 2/5 - model download, indexing and label checks")
+    # The processor pulled the small files already; this adds the weights beside them.
     model_path, model_revision = resolve_model_snapshot(cfg)
-    processor = load_processor(cfg, model_path)
-    tokenizer = processor.tokenizer
-    feature_extractor = processor.feature_extractor
 
     splits: Dict[str, ViMDDataset] = {
         split: ViMDDataset(

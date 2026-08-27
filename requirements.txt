@@ -17,6 +17,13 @@ torch==2.5.1+cu121
 # publishes its 6.17 GB fp32 weights only in .bin form - no safetensors. main.py
 # also carries a runtime .bin -> safetensors fallback, but this pin avoids the
 # whole detour.
+#
+# One consequence worth knowing before "optimising" the tokenizer: up to and including
+# 4.53, WhisperProcessor declares tokenizer_class = "WhisperTokenizer" and rejects a
+# WhisperTokenizerFast outright ("Received a WhisperTokenizerFast for argument tokenizer,
+# but a WhisperTokenizer was expected"); only 4.56 accepts both. load_processor asks the
+# installed class which tokenizers it accepts, so it works either way - do not pin a
+# tokenizer class back into it.
 transformers==4.51.3
 accelerate==1.6.0
 tokenizers==0.21.1
