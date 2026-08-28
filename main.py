@@ -227,6 +227,9 @@ class Config:
             "download_retries": self.download_retries,
             "prepare_sweeps": self.prepare_sweeps,
             "sampling_rate": self.sampling_rate,
+            # A zero-length mask reaches _compute_mask_indices and fails inside the model.
+            "mask_time_length": self.mask_time_length,
+            "mask_feature_length": self.mask_feature_length,
         }
         for name, value in positive_ints.items():
             if not isinstance(value, int) or value < 1:
@@ -246,6 +249,11 @@ class Config:
             raise ValueError(f"max_grad_norm must be positive, got {self.max_grad_norm!r}")
         if self.weight_decay < 0:
             raise ValueError(f"weight_decay must be non-negative, got {self.weight_decay!r}")
+        if self.early_stopping_threshold < 0:
+            raise ValueError(
+                f"early_stopping_threshold must be non-negative, got "
+                f"{self.early_stopping_threshold!r}"
+            )
         for name in ("mask_time_prob", "mask_feature_prob"):
             value = getattr(self, name)
             if not 0.0 <= value < 1.0:
@@ -749,6 +757,32 @@ _SHARD_NAME_RE = re.compile(
     r"^data/(?P<split>train|valid|test)-(?P<index>\d+)-of-\d+\.parquet$"
 )
 
+# Columns without which a shard is unusable: the audio itself, and the transcript that every
+# training label and every WER figure is built from. The metadata comprehension below skips
+# any column the schema does not carry, which is right for the optional ones (gender,
+# speakerID, ...) but would absorb a renamed `text` silently - turning every reference into an
+# empty string, dropping the whole training split, and only surfacing hours later as
+# "every checkpoint scored an undefined WER".
+REQUIRED_COLUMNS: Tuple[str, ...] = ("audio", "text")
+
+
+class DatasetSchemaError(RuntimeError):
+    """The parquet layout is not the one this pipeline reads.
+
+    Distinct from a download failure because retrying cannot help: every shard of the split
+    carries the same schema, so the sweep loop re-raises this instead of spending its remaining
+    sweeps and their pauses on shards that will all fail identically."""
+
+
+def _require_columns(present: Sequence[str], filename: str) -> None:
+    missing = [name for name in REQUIRED_COLUMNS if name not in present]
+    if missing:
+        raise DatasetSchemaError(
+            f"{filename} has no {', '.join(missing)} column(s); it carries {sorted(present)}. "
+            f"The dataset layout is not the one main.py reads. Check VIMD_DATASET_ID and the "
+            f"repo's parquet schema."
+        )
+
 
 def _decode_wav_bytes(raw: bytes) -> Tuple[np.ndarray, int]:
     """Decode WAV bytes to float32 samples in [-1, 1] plus the native sample rate."""
@@ -809,6 +843,11 @@ def _retry(operation, description: str, attempts: int):
     for attempt in range(1, attempts + 1):
         try:
             return operation()
+        except (KeyboardInterrupt, SystemExit):
+            # An operator's Ctrl-C is not a network failure. Retrying it would sleep through the
+            # interrupt for over a minute and then report the run as failed rather than
+            # interrupted, losing main()'s resume message and its exit status of 130.
+            raise
         except BaseException as exc:  # noqa: BLE001 - network failures are broad by nature
             last_error = exc
             wait = min(60.0, 5.0 * (2 ** (attempt - 1)))
@@ -887,6 +926,7 @@ def _convert_one_shard(
         with pq.ParquetFile(str(parquet_path)) as parquet_file, \
                 open(bin_path, "wb") as audio_out, \
                 open(jsonl_path, "w", encoding="utf-8") as meta_out:
+            _require_columns(parquet_file.schema_arrow.names, filename)
             offset = 0
             for batch in parquet_file.iter_batches(batch_size=8):
                 audio_column = batch.column("audio")
@@ -1108,6 +1148,11 @@ def _prepare_dataset_locked(cfg: Config) -> str:
                 started = time.time()
                 try:
                     rows, seconds = _convert_one_shard(cfg, name, split_dir, index, revision)
+                except (KeyboardInterrupt, SystemExit, DatasetSchemaError):
+                    # A Ctrl-C recorded as a shard failure would let preparation run on for
+                    # hours; a schema mismatch is identical for every remaining shard, so
+                    # sweeping them only adds pauses before the same abort.
+                    raise
                 except BaseException as exc:  # noqa: BLE001
                     LOGGER.error("shard %s failed: %s\n%s", name, exc, traceback.format_exc())
                     failures.append((index, name))
@@ -1524,7 +1569,7 @@ def _convert_bin_to_safetensors(cfg: Config, source: Path) -> Path:
 
 
 def load_model(
-    cfg: Config, model_path: Path, source: Optional[str] = None
+    cfg: Config, model_path: Path, source: Optional[str] = None, tokenizer: Any = None
 ) -> WhisperForConditionalGeneration:
     """Load either the pretrained snapshot (source=None) or a local checkpoint."""
     path = source or str(model_path)
@@ -1541,11 +1586,45 @@ def load_model(
             low_cpu_mem_usage=True,
             torch_dtype=torch.float32,
         )
-    return configure_model(model, cfg)
+    return configure_model(model, cfg, tokenizer)
+
+
+def _verify_generation_config(
+    model: WhisperForConditionalGeneration, cfg: Config, tokenizer: Any
+) -> None:
+    """Prove the loaded weights can honour language=vi now, not at the first evaluation.
+
+    Both mismatches below are invisible until generate() first runs - `eval_steps` into
+    training, an hour of GPU time later - and only one of them raises. A
+    decoder_start_token_id that disagrees with the tokenizer does not fail at all: the collator
+    strips the tokenizer's <|startoftranscript|> while the model prepends the config's, so every
+    label would be shifted by one token and the run would quietly train the wrong thing."""
+    sot_id = tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+    config_sot = model.config.decoder_start_token_id
+    if sot_id is not None and config_sot is not None and int(config_sot) != int(sot_id):
+        raise RuntimeError(
+            f"config.decoder_start_token_id={config_sot} but {type(tokenizer).__name__} maps "
+            f"<|startoftranscript|> to {sot_id}. WhisperCollator strips the tokenizer's id and "
+            f"the model prepends the config's, so every training label would be shifted by one "
+            f"token. Fix decoder_start_token_id in the snapshot's config.json."
+        )
+
+    # lang_to_id is keyed by the token form ("<|vi|>"); accept the bare code too, since
+    # transformers maps one to the other before looking it up.
+    lang_to_id = getattr(model.generation_config, "lang_to_id", None)
+    token = f"<|{cfg.language}|>"
+    if not isinstance(lang_to_id, dict) or not ({token, cfg.language} & set(lang_to_id)):
+        raise RuntimeError(
+            f"{cfg.model_id}'s generation_config has no lang_to_id entry for {token}, so "
+            f"generate(language={cfg.language!r}) would raise at the first evaluation - roughly "
+            f"{cfg.eval_steps} optimiser steps in. Either the snapshot ships an outdated "
+            f"generation_config.json, or Config.language names a language this model was not "
+            f"trained for."
+        )
 
 
 def configure_model(
-    model: WhisperForConditionalGeneration, cfg: Config
+    model: WhisperForConditionalGeneration, cfg: Config, tokenizer: Any = None
 ) -> WhisperForConditionalGeneration:
     """Pin the decoding task and enable SpecAugment.
 
@@ -1570,6 +1649,10 @@ def configure_model(
     model.config.mask_feature_length = cfg.mask_feature_length
 
     model.config.use_cache = False  # required alongside gradient checkpointing
+
+    # Cheap and GPU-free, so it also re-checks every checkpoint reloaded in stages 4 and 5.
+    if tokenizer is not None:
+        _verify_generation_config(model, cfg, tokenizer)
     return model
 
 
@@ -2337,9 +2420,13 @@ def run(cfg: Config) -> int:
 
     if cfg.results_path.exists():
         existing = _read_json(cfg.results_path)
-        test_wer = (existing or {}).get("test", {}).get("wer_normalized") if existing else None
-        if isinstance(test_wer, (int, float)):
-            previous_recipe = (existing or {}).get("recipe")
+        # Anything that is not a dict carrying a dict "test" is damage, not a result. A list, a
+        # null "test" or a truncated file must reach the quarantine branch below; reading
+        # through them blindly raised AttributeError instead.
+        test_block = existing.get("test") if isinstance(existing, dict) else None
+        test_wer = test_block.get("wer_normalized") if isinstance(test_block, dict) else None
+        if isinstance(test_wer, (int, float)) and not isinstance(test_wer, bool):
+            previous_recipe = existing.get("recipe")
             if previous_recipe == recipe:
                 LOGGER.info(
                     "%s already holds a complete result for this exact recipe "
@@ -2428,7 +2515,7 @@ def run(cfg: Config) -> int:
     model: Optional[WhisperForConditionalGeneration] = None
 
     for attempt in range(cfg.oom_retries + 1):
-        model = load_model(cfg, model_path)
+        model = load_model(cfg, model_path, tokenizer=tokenizer)
         trainer = build_seq2seq_trainer(
             cfg=cfg,
             model=model,
@@ -2541,7 +2628,9 @@ def run(cfg: Config) -> int:
         def decode(on_progress, resume_from, _candidate=candidate):
             nonlocal scored_model
             if scored_model is None:
-                scored_model = load_model(cfg, model_path, source=str(_candidate))
+                scored_model = load_model(
+                    cfg, model_path, source=str(_candidate), tokenizer=tokenizer
+                )
             return transcribe_dataset(
                 model=scored_model,
                 dataset=valid_dataset,
@@ -2596,7 +2685,9 @@ def run(cfg: Config) -> int:
         cfg.output_dir / "valid_predictions.csv", valid_dataset, best_hyps, best_report
     )
 
-    best_model = load_model(cfg, model_path, source=best_entry["checkpoint"])
+    best_model = load_model(
+        cfg, model_path, source=best_entry["checkpoint"], tokenizer=tokenizer
+    )
     best_model.config.use_cache = True  # the saved artefact is for inference
     cfg.best_model_dir.mkdir(parents=True, exist_ok=True)
     best_model.save_pretrained(str(cfg.best_model_dir), safe_serialization=True)
