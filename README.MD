@@ -390,22 +390,52 @@ VIMD_TRAIN_BATCH_SIZE=8 VIMD_GRAD_ACCUM=8 python3 main.py
 
 ---
 
-## 10. Repository layout
+## 10. Listening to individual utterances
 
-```
-main.py            the entire pipeline, self-contained
-requirements.txt   pinned dependencies
-README.MD          this file
-data/              created at runtime: the 16 kHz cache
-outputs/           created at runtime: models, metrics, predictions, logs
+Error analysis usually ends with wanting to *hear* a specific utterance. `download_samples.py`
+fetches named utterances on their own, without preparing the whole 60 GB dataset:
+
+```bash
+python3 download_samples.py                          # the five outliers from the error analysis
+python3 download_samples.py 73_0332 81_0303.wav      # any utterance, .wav optional
+python3 download_samples.py --also-16k               # plus the 16 kHz mono the model actually hears
+python3 download_samples.py --source local           # read the prepared cache, no network
 ```
 
-`main.py` is deliberately a single file with no local imports: nothing can break from a partial
-upload or a Python path surprise on the training server.
+Audio lands in `outputs/audio_samples/`, one `.wav` per utterance plus `samples.json` carrying the
+reference transcript, region, province, speaker and duration for each. The utterance name is the
+`filename` column of the prediction CSVs, so any row of `test_predictions.csv` can be listened to
+directly.
+
+How it avoids the 60 GB: parquet is columnar and split into row groups, so the script opens each
+shard **over the network** and reads only the `filename` column to locate the utterance, then pulls
+just the one row group holding it — tens of MB instead of tens of GB. The filename listing is
+cached in `outputs/audio_samples/_filename_index.json`, so looking up further utterances later is
+instant. If `data/vimd_16k/` already exists it is used first and no network is touched at all.
+Original WAV bytes are written through verbatim, so the audio is bit-identical to the published
+dataset. If range requests are unavailable the script falls back to downloading whole shards,
+scanning and deleting them one at a time.
 
 ---
 
-## 11. Citation
+## 11. Repository layout
+
+```
+main.py               the entire pipeline, self-contained
+download_samples.py   standalone utility: fetch named utterances to listen to
+requirements.txt      pinned dependencies
+README.MD             this file
+data/                 created at runtime: the 16 kHz cache
+outputs/              created at runtime: models, metrics, predictions, logs
+```
+
+`main.py` is deliberately a single file with no local imports: nothing can break from a partial
+upload or a Python path surprise on the training server. `download_samples.py` follows the same
+rule — it does not import `main.py`, so it can be copied to a laptop and run on its own.
+
+---
+
+## 12. Citation
 
 ViMD — Nguyen et al., *Multi-Dialect Vietnamese: Task, Dataset, Baseline Models and Challenges*,
 EMNLP 2024. PhoWhisper — Le et al., *PhoWhisper: Automatic Speech Recognition for Vietnamese*,
