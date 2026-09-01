@@ -342,8 +342,10 @@ class HubReader:
             try:
                 fs = self._filesystem()
                 path = f"datasets/{self.dataset_id}@{self.revision}/{filename}"
+                # Chỉ thử vài lần: nếu range request không dùng được thì đường fallback
+                # bên dưới mới là chỗ đáng bỏ thời gian retry, không phải ở đây.
                 handle = _retry(
-                    lambda: fs.open(path, "rb"), f"mở {filename} qua mạng", self.retries
+                    lambda: fs.open(path, "rb"), f"mở {filename} qua mạng", min(2, self.retries)
                 )
                 parquet_file = pq.ParquetFile(handle)
                 return parquet_file, handle.close

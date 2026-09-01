@@ -407,6 +407,11 @@ reference transcript, region, province, speaker and duration for each. The utter
 `filename` column of the prediction CSVs, so any row of `test_predictions.csv` can be listened to
 directly.
 
+`download_samples_colab.ipynb` does the same on Google Colab — nothing to install locally, and the
+utterances play inline in the browser with their reference and predicted text side by side. Open it
+in Colab and `Runtime → Run all`. The notebook is deliberately self-contained: it embeds the same
+fetch logic rather than importing the script, so opening the link is enough.
+
 How it avoids the 60 GB: parquet is columnar and split into row groups, so the script opens each
 shard **over the network** and reads only the `filename` column to locate the utterance, then pulls
 just the one row group holding it — tens of MB instead of tens of GB. The filename listing is
@@ -421,12 +426,13 @@ scanning and deleting them one at a time.
 ## 11. Repository layout
 
 ```
-main.py               the entire pipeline, self-contained
-download_samples.py   standalone utility: fetch named utterances to listen to
-requirements.txt      pinned dependencies
-README.MD             this file
-data/                 created at runtime: the 16 kHz cache
-outputs/              created at runtime: models, metrics, predictions, logs
+main.py                        the entire pipeline, self-contained
+download_samples.py            standalone utility: fetch named utterances to listen to
+download_samples_colab.ipynb   the same, as a Google Colab notebook with inline players
+requirements.txt               pinned dependencies
+README.MD                      this file
+data/                          created at runtime: the 16 kHz cache
+outputs/                       created at runtime: models, metrics, predictions, logs
 ```
 
 `main.py` is deliberately a single file with no local imports: nothing can break from a partial
