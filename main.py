@@ -61,14 +61,13 @@ import errno
 import gc
 try:
     import fcntl
-except ImportError as exc:  # pragma: no cover - Windows has no fcntl
-    # The only thing in this file that is not portable. Raised here rather than left
-    # as a bare "No module named 'fcntl'", which says nothing about the cause.
-    raise RuntimeError(
-        "This pipeline runs on Linux. fcntl, which the output-directory lock needs, does "
-        "not exist on Windows. Use WSL2 - the Windows NVIDIA driver provides CUDA inside "
-        "it, so the GPU still works - or a Linux host. See README.MD section 2."
-    ) from exc
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    # The only non-portable thing in this file, and only DirectoryLock needs it. Import
+    # softly so the module still loads on Windows: selfcheck.py exercises everything
+    # except the lock, and being able to verify a GPU and the W&B wiring from a Windows
+    # workstation is worth more than refusing at import. A real run still stops, at the
+    # point where the missing lock would otherwise let two jobs corrupt one directory.
+    fcntl = None  # type: ignore[assignment]
 import hashlib
 import io
 import itertools
@@ -436,6 +435,14 @@ class DirectoryLock:
         self._fd: Optional[int] = None
 
     def acquire(self) -> "DirectoryLock":
+        if fcntl is None:
+            raise RuntimeError(
+                f"cannot lock {self.directory} for {self.purpose}: this is native Windows, "
+                f"which has no fcntl.flock, and without it two runs could write the same "
+                f"output directory and corrupt each other's checkpoints. Training must run "
+                f"on Linux - under WSL2 the Windows NVIDIA driver still provides CUDA. "
+                f"selfcheck.py does not need the lock and runs here as it is."
+            )
         if self._fd is not None:
             return self
         self.directory.mkdir(parents=True, exist_ok=True)

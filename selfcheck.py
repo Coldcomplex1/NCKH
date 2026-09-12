@@ -42,15 +42,6 @@ if not (3, 9) <= sys.version_info[:2] <= (3, 13):
           f"               uv venv --python 3.12 && . .venv/bin/activate")
     sys.exit(1)
 
-if sys.platform == "win32":
-    print("selfcheck: this project runs on Linux, and you are on native Windows.\n"
-          "           main.py needs fcntl for its output-directory lock, which Windows\n"
-          "           has no equivalent of. Use WSL2 - the Windows NVIDIA driver provides\n"
-          "           CUDA inside it, so your GPU still works:\n"
-          "               wsl --install -d Ubuntu      (PowerShell, as Administrator)\n"
-          "           then run this from the Ubuntu shell. See README.MD section 2.")
-    sys.exit(1)
-
 try:
     import numpy as np  # noqa: E402
     import torch  # noqa: E402

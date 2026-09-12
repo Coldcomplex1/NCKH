@@ -10,7 +10,12 @@
 # wheel works too (`pip install torch==2.5.1`): it is a cu124 build and CUDA 12
 # minor-version compatibility covers a 12.2 driver.
 --extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.5.1+cu121
+torch==2.5.1+cu121; sys_platform == "linux"
+# Windows is not a training target - main.py needs fcntl for the output-directory
+# lock - but selfcheck.py runs there, so the workstation someone verifies a GPU and
+# the W&B wiring on can install this file too. The +cu121 local version is published
+# for Linux only; the plain Windows wheel bundles CUDA already.
+torch==2.5.1; sys_platform == "win32"
 
 # transformers is deliberately held below 4.52. From 4.52 onwards it refuses to
 # torch.load a pytorch_model.bin unless torch >= 2.6, and vinai/PhoWhisper-large
