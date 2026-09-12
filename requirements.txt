@@ -44,3 +44,14 @@ scipy==1.15.2; python_version >= "3.13"
 # WER / CER. jiwer is called directly rather than through `evaluate`, which would
 # download a metric script from the Hub in the middle of training.
 jiwer==3.1.0
+
+# Experiment tracking, optional at runtime. main.py only imports wandb when
+# VIMD_WANDB=1, so a missing install degrades to a warning rather than a crash,
+# and the default run never touches it at all.
+#
+# Pinned at 0.22.3 because it still declares python_requires >= 3.8. wandb 0.25
+# raises that to 3.9 and 0.30 to 3.10, either of which would quietly break the
+# 3.9 fallback this README allows. Its dependencies (protobuf<7, pydantic<3,
+# sentry-sdk) do not collide with anything pinned above. wandb.Audio needs
+# soundfile, which is already required for WAV decoding.
+wandb==0.22.3
