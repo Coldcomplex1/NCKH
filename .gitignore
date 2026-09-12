@@ -19,6 +19,11 @@ outputs*/
 # in whatever directory it is invoked from.
 wandb/
 
+# The W&B API key, when one is shipped with a copy of this tree (run.sh reads it).
+# It must never be committed: GitHub rejects pushes carrying a W&B key, and one
+# that reaches a public repository is reported to W&B and revoked.
+wandb.key
+
 # Python bytecode.
 __pycache__/
 *.py[cod]
