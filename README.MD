@@ -627,6 +627,11 @@ printf '%s' 'YOUR_KEY' > wandb.key && chmod 600 wandb.key
 tar czf vimd.tar.gz --exclude=data --exclude=outputs .
 ```
 
+The file holds the key and nothing else. wandb accepts a key of **at least** 40 characters,
+optionally with a variable-length prefix and a dash before them, so do not treat a longer key as
+malformed — the one constraint wandb enforces is that it must not begin or end with whitespace,
+which is why `run.sh` strips any and why `printf`/`-NoNewline` matter more than the length.
+
 `wandb.key` is in `.gitignore` and must stay uncommitted. That is enforced, not merely advised:
 GitHub enables push protection for Weights & Biases keys by default, so a commit carrying one is
 rejected at push time, and a key that does reach a public repository is reported to W&B and
