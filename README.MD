@@ -12,18 +12,29 @@ finish, needs no interaction, and resumes automatically if it is interrupted.
 ## 1. How to run
 
 ```bash
-pip install -r requirements.txt
+bash run.sh
 ```
 
+That is the whole procedure. `run.sh` installs the pinned dependencies and starts the run; the
+script downloads the model and the dataset itself, nothing has to be placed on disk beforehand,
+and no prompt is ever shown.
+
+Because the run outlives most SSH sessions, start it detached:
+
 ```bash
+tmux new -s vimd 'bash run.sh'      # detach with Ctrl-B then D
+```
+
+The two steps separately, if you prefer them explicit — identical except that experiment
+tracking is then off unless you ask for it (§10):
+
+```bash
+pip install -r requirements.txt
 python3 main.py
 ```
 
-That is the whole procedure. The script downloads the model and the dataset itself; nothing has to
-be placed on disk beforehand and no prompt is ever shown.
-
 Expected wall-clock on one 80 GB GPU: **~2–3 h** of one-time data preparation (network bound), then
-**~8–12 h** of training and evaluation. Re-running `python3 main.py` after a crash, a timeout or a
+**~8–12 h** of training and evaluation. Re-running `bash run.sh` after a crash, a timeout or a
 reboot resumes rather than starting over — see §8 for exactly how much work is repeated.
 
 Only one run may use an output directory at a time; a second launch aborts immediately with a clear
@@ -396,7 +407,7 @@ Every tunable is settable without editing code. Defaults in brackets.
 Example — smaller GPU, same effective batch:
 
 ```bash
-VIMD_TRAIN_BATCH_SIZE=8 VIMD_GRAD_ACCUM=8 python3 main.py
+VIMD_TRAIN_BATCH_SIZE=8 VIMD_GRAD_ACCUM=8 bash run.sh
 ```
 
 ---
@@ -407,10 +418,24 @@ Off by default. Without `VIMD_WANDB=1` nothing changes: no `wandb` import, no ne
 call, no login prompt — which matters because this job runs unattended for hours and a
 tracker sitting on a prompt would waste a night.
 
+`bash run.sh` turns it on; a bare `python3 main.py` leaves it off. To log to wandb.ai live,
+authenticate once on the machine first:
+
 ```bash
-pip install -r requirements.txt          # installs wandb==0.22.3
 wandb login                              # once per machine; the key lands in ~/.netrc
-VIMD_WANDB=1 python3 main.py
+bash run.sh
+```
+
+**Without credentials the run still records — it does not stop to ask.** `main.py` checks for a
+key the same way wandb does (`WANDB_API_KEY`, then the netrc entry for the API host) *before*
+calling `wandb.init`, and falls back to offline recording when it finds none, printing the
+`wandb sync` command to upload afterwards. This matters more than it sounds: wandb asks for a
+missing key through `getpass()`, which returns without asking only when there is no tty — and
+under tmux there is one, so an unconfigured host would otherwise hold the GPU at a password
+prompt all night.
+
+```bash
+VIMD_WANDB=0 bash run.sh                 # or skip tracking altogether
 ```
 
 **Credentials never live in this repository.** There is no config field for an API key
@@ -449,7 +474,7 @@ nine costs the graphs, not the training.
 ### No network on the training host
 
 ```bash
-VIMD_WANDB=1 WANDB_MODE=offline python3 main.py
+WANDB_MODE=offline bash run.sh          # force offline even where a key exists
 wandb sync outputs/wandb/offline-run-*     # later, from a machine with network
 ```
 
@@ -470,6 +495,7 @@ accordingly: each trial retains up to `VIMD_SAVE_TOTAL_LIMIT` checkpoints at ~19
 ## 11. Repository layout
 
 ```
+run.sh             entry point: install, then train
 main.py            the entire pipeline, self-contained
 requirements.txt   pinned dependencies
 README.MD          this file

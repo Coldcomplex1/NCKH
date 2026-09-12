@@ -66,6 +66,7 @@ import itertools
 import json
 import logging
 import math
+import netrc
 import platform
 import random
 import re
@@ -75,6 +76,7 @@ import sys
 import time
 import traceback
 import unicodedata
+import urllib.parse
 import uuid
 import wave
 from dataclasses import asdict, dataclass, field
@@ -621,6 +623,27 @@ class WandbRun:
         os.environ["WANDB_WATCH"] = "false"
         os.environ.setdefault("WANDB_PROJECT", cfg.wandb_project)
 
+        mode = cfg.wandb_mode
+        if mode == "online" and not self._has_credentials():
+            # wandb asks for a missing key through getpass(), which returns False
+            # only when there is no tty. The lab runs this inside tmux, where there
+            # is one, so an unconfigured host would sit on that prompt for the whole
+            # night - precisely the failure this file's WANDB_DISABLED default was
+            # written to prevent. Record locally instead and let it be synced later.
+            LOGGER.warning(
+                "VIMD_WANDB=1 but no wandb credentials were found (no WANDB_API_KEY, "
+                "no netrc entry for %s). Recording offline so the run cannot block on "
+                "a login prompt. To upload afterwards:\n"
+                "    wandb sync %s",
+                self._api_host(), wandb_root / "offline-run-*",
+            )
+            LOGGER.warning(
+                "To log live instead, run `wandb login` once on this machine (or export "
+                "WANDB_API_KEY) and re-launch; the run resumes into the same record."
+            )
+            mode = "offline"
+        os.environ["WANDB_MODE"] = mode
+
         self.run_id = self._resolve_run_id(cfg)
         config = {**cfg.to_dict(), **{f"env/{k}": v for k, v in environment.items()}}
         try:
@@ -629,13 +652,16 @@ class WandbRun:
                 entity=cfg.wandb_entity or None,
                 id=self.run_id,
                 resume="allow",  # the same id after a crash means one continuous run
-                mode=cfg.wandb_mode,
+                mode=mode,
                 dir=str(cfg.output_dir),
                 name=cfg.wandb_run_name or f"{cfg.output_dir.name}-{self.run_id}",
                 notes=cfg.wandb_notes or None,
                 tags=[tag.strip() for tag in cfg.wandb_tags.split(",") if tag.strip()],
                 config=_json_safe(config),
-                settings=wandb.Settings(init_timeout=120),
+                # login_timeout is the second line of defence behind the credential
+                # check above: even a prompt reached by some path this misses gives up
+                # rather than holding the GPU idle until someone notices.
+                settings=wandb.Settings(init_timeout=120, login_timeout=30),
             )
         except BaseException as exc:  # noqa: BLE001 - tracking must never end a run
             LOGGER.warning("wandb.init failed (%s); continuing without tracking", exc)
@@ -646,9 +672,41 @@ class WandbRun:
         LOGGER.info(
             "wandb run %s (%s) -> %s",
             self.run_id,
-            cfg.wandb_mode,
+            mode,
             getattr(self.run, "url", None) or "offline, sync later with `wandb sync`",
         )
+
+    @staticmethod
+    def _api_host() -> str:
+        base = os.environ.get("WANDB_BASE_URL", "") or "https://api.wandb.ai"
+        return urllib.parse.urlparse(base).netloc or "api.wandb.ai"
+
+    @classmethod
+    def _has_credentials(cls) -> bool:
+        """True when wandb can authenticate without asking a human.
+
+        Mirrors wandb's own lookup order - WANDB_API_KEY, then the netrc entry for
+        the API host - so that "no credentials" here means the same thing it means
+        one function call later, inside wandb.init()."""
+        if os.environ.get("WANDB_API_KEY", "").strip():
+            return True
+        override = os.environ.get("NETRC", "").strip()
+        candidates = (
+            [Path(override).expanduser()]
+            if override
+            else [Path.home() / ".netrc", Path.home() / "_netrc"]
+        )
+        host = cls._api_host()
+        for candidate in candidates:
+            try:
+                if not candidate.is_file():
+                    continue
+                authenticators = netrc.netrc(str(candidate)).authenticators(host)
+            except BaseException:  # noqa: BLE001 - an unreadable netrc is "no key"
+                continue
+            if authenticators and authenticators[2]:
+                return True
+        return False
 
     @staticmethod
     def _resolve_run_id(cfg: Config) -> str:
