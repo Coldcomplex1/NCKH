@@ -571,6 +571,31 @@ wandb login                              # once per machine; the key lands in ~/
 bash run.sh
 ```
 
+### Handing the code to someone else to run
+
+When the machine that runs this is not the machine that owns the W&B account, put the key in
+`wandb.key` next to `run.sh` **before** you archive the tree. `run.sh` exports it, so whoever
+runs the job types nothing and never sees a prompt:
+
+```bash
+printf '%s' 'YOUR_KEY' > wandb.key && chmod 600 wandb.key
+tar czf vimd.tar.gz --exclude=data --exclude=outputs .
+```
+
+`wandb.key` is in `.gitignore` and must stay uncommitted. That is enforced, not merely advised:
+GitHub enables push protection for Weights & Biases keys by default, so a commit carrying one is
+rejected at push time, and a key that does reach a public repository is reported to W&B and
+revoked — breaking tracking on the training host rather than protecting anything. A key that has
+been committed is not recoverable by deleting the commit; rotate it at
+[wandb.ai/authorize](https://wandb.ai/authorize).
+
+Shipping no key at all is also a complete answer: the run records offline, and whoever owns the
+account syncs it afterwards from their own machine, where they are already logged in.
+
+```bash
+wandb sync outputs/wandb/offline-run-*   # from the account owner's machine
+```
+
 **Without credentials the run still records — it does not stop to ask.** `main.py` checks for a
 key the same way wandb does (`WANDB_API_KEY`, then the netrc entry for the API host) *before*
 calling `wandb.init`, and falls back to offline recording when it finds none, printing the

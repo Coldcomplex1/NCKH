@@ -43,5 +43,24 @@ fi
 # and prints the `wandb sync` command. Set VIMD_WANDB=0 to skip tracking entirely.
 export VIMD_WANDB="${VIMD_WANDB:-1}"
 
+# An API key shipped alongside this copy, so the training host never has to type
+# one and nobody has to run `wandb login` there. wandb.key is in .gitignore: it
+# travels inside the archive you hand over and never reaches the repository.
+#
+# That is not only a policy. GitHub enables push protection for Weights & Biases
+# keys by default, so a commit carrying one is rejected at push time, and a key
+# that does reach a public repository is reported to W&B and revoked - which
+# would break tracking on the training host rather than secure anything.
+#
+# To arm it, on your own machine, before sending the code over:
+#     printf '%s' 'YOUR_KEY' > wandb.key && chmod 600 wandb.key
+if [ -z "${WANDB_API_KEY:-}" ] && [ -s wandb.key ]; then
+    # tr strips the trailing newline a `echo > wandb.key` leaves behind, which
+    # would otherwise be sent as part of the key and fail authentication.
+    WANDB_API_KEY="$(tr -d '[:space:]' < wandb.key)"
+    export WANDB_API_KEY
+    echo "==> wandb: using the key shipped in wandb.key"
+fi
+
 echo "==> starting; full log also at outputs/logs/train.log"
 exec python3 main.py
