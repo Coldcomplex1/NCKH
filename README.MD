@@ -46,8 +46,8 @@ message rather than interleaving writes.
 
 | | |
 |---|---|
-| OS / arch | Linux x86_64 |
-| Python | **3.10 – 3.12** recommended (3.9 and 3.13 also resolve) |
+| OS / arch | Linux x86_64 for training. `selfcheck.py` also runs on native Windows — only the output-directory lock needs `fcntl`, and it is the one non-portable thing here, so a Windows workstation can verify a GPU and the W&B wiring without WSL. |
+| Python | **3.10 – 3.12** recommended; 3.9 and 3.13 also resolve. **3.14+ does not**: torch 2.5.1 publishes no wheel above cp313, so `requirements.txt` cannot be installed on it. `run.sh` and `selfcheck.py` check this and say so. |
 | GPU | one NVIDIA GPU with ≥ 80 GB VRAM (A100 80 GB / H100) |
 | CUDA | driver reporting CUDA 12.2; `torch==2.5.1+cu121` |
 | CPU RAM | ≥ 32 GB (peak use is well under the lab's 64 GB) |
@@ -58,6 +58,27 @@ Disk budget: ~12 GB for the 16 kHz audio cache, ~19 GB per retained training che
 by default), 6.2 GB for the selected model, 6.2 GB for the Hub model cache. The raw 59.8 GB of
 parquet is **never** all on disk at once — shards are downloaded, converted and deleted one at a
 time, so peak raw usage is about one shard (~0.5 GB).
+
+### Windows
+
+`selfcheck.py` runs on native Windows, in PowerShell, against the local GPU — useful for
+confirming the machine and the W&B setup before handing the code to a Linux host:
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python selfcheck.py
+```
+
+`requirements.txt` resolves on both platforms: the `+cu121` local version is published for Linux
+only, so Windows takes the plain `torch==2.5.1` wheel, which bundles CUDA already.
+
+Training itself still needs Linux. `run.sh` is a shell script, and `DirectoryLock` needs
+`fcntl.flock` — without it two runs could write one output directory and corrupt each other's
+checkpoints, so `main.py` stops there rather than proceeding unlocked. Under WSL2 the Windows
+NVIDIA driver provides CUDA, so the GPU is still used; clone into the Linux filesystem rather
+than `/mnt/c`, which is slow enough to matter for a 12 GB cache.
 
 Both `pip` steps must come from the pinned `requirements.txt`. In particular `transformers` is held
 at **4.51.3**: from 4.52 onward transformers refuses to `torch.load` a `pytorch_model.bin` unless
@@ -571,6 +592,30 @@ wandb login                              # once per machine; the key lands in ~/
 bash run.sh
 ```
 
+### Checking the setup before a real run
+
+`selfcheck.py` verifies the machine, the install and the W&B wiring in about a minute, and
+**downloads nothing** — no model, no dataset, no Hub access. It builds a ~10k-parameter Whisper
+from a config, writes a few synthetic shards in the cache format of §3, and drives the real
+functions from `main.py` over them on the real GPU:
+
+```bash
+python3 selfcheck.py
+```
+
+It checks, and names the fix for whichever fails: the GPU is visible and runs a kernel; the pinned
+dependencies import; W&B credentials resolve without a prompt; a run opens; `ViMDDataset` reads the
+shard format; `Seq2SeqTrainer` trains **on the GPU** and logs into that same run rather than opening
+a second; the tables, dialect charts, prediction samples and audio clips are all written; result
+files upload as an artifact; and a restart reattaches to the same run instead of starting another.
+
+Exit status is 0 only when every check passes. It writes to `outputs_selfcheck/` and removes it
+afterwards (`VIMD_SELFCHECK_KEEP=1` keeps it), so it never touches `data/`, `outputs/` or any
+checkpoint, and is safe to run while a real job is in progress.
+
+It is not a substitute for the smoke test below: nothing here exercises the Hub download, the
+PhoWhisper tokenizer, shard conversion, beam search or the repair pass.
+
 ### Handing the code to someone else to run
 
 When the machine that runs this is not the machine that owns the W&B account, put the key in
@@ -667,6 +712,7 @@ accordingly: each trial retains up to `VIMD_SAVE_TOTAL_LIMIT` checkpoints at ~19
 ```
 run.sh             entry point: install, then train
 main.py            the entire pipeline, self-contained
+selfcheck.py       one-minute GPU + W&B verification; downloads nothing
 requirements.txt   pinned dependencies
 README.MD          this file
 .gitignore         the runtime directories below, which must never be committed

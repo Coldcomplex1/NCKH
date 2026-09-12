@@ -59,7 +59,15 @@ import atexit
 import csv
 import errno
 import gc
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    # The only non-portable thing in this file, and only DirectoryLock needs it. Import
+    # softly so the module still loads on Windows: selfcheck.py exercises everything
+    # except the lock, and being able to verify a GPU and the W&B wiring from a Windows
+    # workstation is worth more than refusing at import. A real run still stops, at the
+    # point where the missing lock would otherwise let two jobs corrupt one directory.
+    fcntl = None  # type: ignore[assignment]
 import hashlib
 import io
 import itertools
@@ -427,6 +435,14 @@ class DirectoryLock:
         self._fd: Optional[int] = None
 
     def acquire(self) -> "DirectoryLock":
+        if fcntl is None:
+            raise RuntimeError(
+                f"cannot lock {self.directory} for {self.purpose}: this is native Windows, "
+                f"which has no fcntl.flock, and without it two runs could write the same "
+                f"output directory and corrupt each other's checkpoints. Training must run "
+                f"on Linux - under WSL2 the Windows NVIDIA driver still provides CUDA. "
+                f"selfcheck.py does not need the lock and runs here as it is."
+            )
         if self._fd is not None:
             return self
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -714,6 +730,9 @@ class WandbRun:
         self.run: Any = None
         self.enabled: bool = False
         self.run_id: str = ""
+        # Why tracking is off, if it is. A swallowed exception that leaves no
+        # retrievable reason makes the failure undiagnosable from outside.
+        self.last_error: str = ""
 
     # -- lifecycle --------------------------------------------------------
     def start(self, cfg: Config, environment: Dict[str, Any]) -> None:
@@ -723,10 +742,8 @@ class WandbRun:
         try:
             import wandb
         except ImportError:
-            LOGGER.warning(
-                "VIMD_WANDB=1 but wandb is not installed (pip install wandb==0.22.3); "
-                "continuing without tracking"
-            )
+            self.last_error = "wandb is not installed (pip install wandb==0.22.3)"
+            LOGGER.warning("VIMD_WANDB=1 but %s; continuing without tracking", self.last_error)
             return
 
         # Keep every byte wandb writes inside the output directory, for the same
@@ -769,27 +786,47 @@ class WandbRun:
 
         self.run_id = self._resolve_run_id(cfg)
         config = {**cfg.to_dict(), **{f"env/{k}": v for k, v in environment.items()}}
-        try:
-            self.run = wandb.init(
-                project=cfg.wandb_project,
-                entity=cfg.wandb_entity or None,
-                id=self.run_id,
-                resume="allow",  # the same id after a crash means one continuous run
-                mode=mode,
-                dir=str(cfg.output_dir),
-                name=cfg.wandb_run_name or f"{cfg.output_dir.name}-{self.run_id}",
-                notes=cfg.wandb_notes or None,
-                tags=[tag.strip() for tag in cfg.wandb_tags.split(",") if tag.strip()],
-                config=_json_safe(config),
-                # login_timeout is the second line of defence behind the credential
-                # check above: even a prompt reached by some path this misses gives up
-                # rather than holding the GPU idle until someone notices.
-                settings=wandb.Settings(init_timeout=120, login_timeout=30),
-            )
-        except BaseException as exc:  # noqa: BLE001 - tracking must never end a run
-            LOGGER.warning("wandb.init failed (%s); continuing without tracking", exc)
-            self.run = None
-            return
+        init_kwargs: Dict[str, Any] = dict(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity or None,
+            id=self.run_id,
+            resume="allow",  # the same id after a crash means one continuous run
+            dir=str(cfg.output_dir),
+            name=cfg.wandb_run_name or f"{cfg.output_dir.name}-{self.run_id}",
+            notes=cfg.wandb_notes or None,
+            tags=[tag.strip() for tag in cfg.wandb_tags.split(",") if tag.strip()],
+            config=_json_safe(config),
+            # login_timeout is the second line of defence behind the credential check
+            # above: even a prompt reached by some path this misses gives up rather
+            # than holding the GPU idle until someone notices.
+            settings=wandb.Settings(init_timeout=120, login_timeout=30),
+        )
+
+        # An online init fails for reasons that have nothing to do with this run: a
+        # revoked or mistyped key (a 401 from upsertBucket), a proxy, a firewall,
+        # wandb.ai being down. Dropping tracking entirely then throws away the whole
+        # record of a twelve-hour job over something fixable afterwards, so fall back
+        # to recording locally and let it be synced once the cause is dealt with.
+        attempts = [mode] if mode != "online" else ["online", "offline"]
+        for attempt in attempts:
+            try:
+                self.run = wandb.init(mode=attempt, **init_kwargs)
+            except BaseException as exc:  # noqa: BLE001 - tracking must never end a run
+                self.last_error = f"wandb.init failed: {exc.__class__.__name__}: {exc}"
+                if attempt != attempts[-1]:
+                    LOGGER.warning("%s", self.last_error)
+                    LOGGER.warning(
+                        "falling back to offline recording so the run is still captured; "
+                        "fix the cause and upload afterwards with:\n    wandb sync %s",
+                        wandb_root / "offline-run-*",
+                    )
+                    continue
+                LOGGER.warning("%s; continuing without tracking", self.last_error)
+                self.run = None
+                return
+            mode = attempt
+            os.environ["WANDB_MODE"] = mode
+            break
         self._wandb = wandb
         self.enabled = True
         LOGGER.info(
@@ -859,13 +896,11 @@ class WandbRun:
         try:
             operation()
         except BaseException as exc:  # noqa: BLE001
+            self.last_error = f"{action} failed: {exc.__class__.__name__}: {exc}"
             LOGGER.warning(
-                "wandb %s failed (%s); tracking is off for the rest of this run", action, exc
+                "wandb %s; tracking is off for the rest of this run", self.last_error
             )
             self.enabled = False
-
-    def log(self, payload: Dict[str, Any]) -> None:
-        self._guard("log", lambda: self.run.log(_json_safe(payload)))
 
     def summary(self, payload: Dict[str, Any]) -> None:
         def apply() -> None:
@@ -906,8 +941,8 @@ class WandbRun:
     def media(self, name: str, items: Sequence[Any]) -> None:
         """Log media objects under one key.
 
-        Separate from log() because that passes its payload through _json_safe;
-        media must reach wandb as the objects themselves. Media also cannot travel
+        Media cannot be passed through _json_safe, which every other writer here
+        applies, and it is deliberately not batched with them. Media also cannot travel
         inside a wandb.Table: a wandb.Audio placed in a table cell serialises as the
         bare string "Audio" and no audio file is written, silently."""
         def apply() -> None:
@@ -3200,6 +3235,16 @@ def preflight(cfg: Config) -> Dict[str, Any]:
 
     if sys.version_info < (3, 9):
         raise RuntimeError(f"Python 3.9+ is required, found {platform.python_version()}")
+    if sys.version_info[:2] > (3, 13):
+        # Not fatal: torch imported, so whatever is installed works. But it is not the
+        # pinned recipe - requirements.txt cannot even be resolved on this interpreter -
+        # so say which stack actually produced the number in final_results.json.
+        LOGGER.warning(
+            "Python %s is newer than the 3.9-3.13 requirements.txt supports: torch 2.5.1 "
+            "publishes no wheel above cp313, so the versions in use here were resolved some "
+            "other way and are not the pinned recipe.",
+            platform.python_version(),
+        )
 
     cfg.validate()
 

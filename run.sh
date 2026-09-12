@@ -19,8 +19,18 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if ! python3 -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 9) else 1)' 2>/dev/null; then
-    echo "run.sh: Python 3.9+ is required, found: $(python3 --version 2>&1)" >&2
+# Both bounds matter. Without the upper one, a too-new interpreter sails past this
+# check and fails several screens later inside pip's resolver with "no matching
+# distribution for torch==2.5.1+cu121", which says nothing about the actual cause.
+if ! python3 -c 'import sys; sys.exit(0 if (3, 9) <= sys.version_info[:2] <= (3, 13) else 1)' 2>/dev/null; then
+    echo "run.sh: this project needs Python 3.9-3.13 (3.10-3.12 recommended)." >&2
+    echo "        Found: $(python3 --version 2>&1)" >&2
+    echo "        torch 2.5.1, which requirements.txt pins, publishes wheels up to" >&2
+    echo "        cp313 only - there is no build of it for 3.14 or newer, so pip" >&2
+    echo "        cannot resolve this file on one." >&2
+    echo "        Point python3 at a 3.12 interpreter, for example:" >&2
+    echo "            uv venv --python 3.12 && . .venv/bin/activate && bash run.sh" >&2
+    echo "            conda create -n vimd python=3.12 -y && conda activate vimd" >&2
     exit 1
 fi
 
