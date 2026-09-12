@@ -3197,6 +3197,16 @@ def preflight(cfg: Config) -> Dict[str, Any]:
 
     if sys.version_info < (3, 9):
         raise RuntimeError(f"Python 3.9+ is required, found {platform.python_version()}")
+    if sys.version_info[:2] > (3, 13):
+        # Not fatal: torch imported, so whatever is installed works. But it is not the
+        # pinned recipe - requirements.txt cannot even be resolved on this interpreter -
+        # so say which stack actually produced the number in final_results.json.
+        LOGGER.warning(
+            "Python %s is newer than the 3.9-3.13 requirements.txt supports: torch 2.5.1 "
+            "publishes no wheel above cp313, so the versions in use here were resolved some "
+            "other way and are not the pinned recipe.",
+            platform.python_version(),
+        )
 
     cfg.validate()
 

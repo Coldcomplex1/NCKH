@@ -35,10 +35,21 @@ os.environ["VIMD_OUTPUT_DIR"] = str(SCRATCH)
 os.environ["VIMD_DATA_DIR"] = str(SCRATCH / "data")
 os.environ["VIMD_RAW_DIR"] = str(SCRATCH / "raw")
 
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
+if not (3, 9) <= sys.version_info[:2] <= (3, 13):
+    print(f"selfcheck: this project needs Python 3.9-3.13, found {sys.version.split()[0]}.\n"
+          f"           torch 2.5.1 publishes no wheel above cp313, so requirements.txt\n"
+          f"           cannot be installed on this interpreter. Use 3.12, for example:\n"
+          f"               uv venv --python 3.12 && . .venv/bin/activate")
+    sys.exit(1)
 
-import main  # noqa: E402
+try:
+    import numpy as np  # noqa: E402
+    import torch  # noqa: E402
+
+    import main  # noqa: E402
+except ImportError as exc:
+    print(f"selfcheck: {exc}.\n           Run `pip install -r requirements.txt` first.")
+    sys.exit(1)
 
 RESULTS: list[tuple[str, bool, str]] = []
 

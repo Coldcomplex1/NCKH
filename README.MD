@@ -47,7 +47,7 @@ message rather than interleaving writes.
 | | |
 |---|---|
 | OS / arch | Linux x86_64 |
-| Python | **3.10 – 3.12** recommended (3.9 and 3.13 also resolve) |
+| Python | **3.10 – 3.12** recommended; 3.9 and 3.13 also resolve. **3.14+ does not**: torch 2.5.1 publishes no wheel above cp313, so `requirements.txt` cannot be installed on it. `run.sh` and `selfcheck.py` check this and say so. |
 | GPU | one NVIDIA GPU with ≥ 80 GB VRAM (A100 80 GB / H100) |
 | CUDA | driver reporting CUDA 12.2; `torch==2.5.1+cu121` |
 | CPU RAM | ≥ 32 GB (peak use is well under the lab's 64 GB) |
