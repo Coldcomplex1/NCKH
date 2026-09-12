@@ -20,6 +20,7 @@ Exit status is 0 only when every check passed.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -50,6 +51,11 @@ try:
 except ImportError as exc:
     print(f"selfcheck: {exc}.\n           Run `pip install -r requirements.txt` first.")
     sys.exit(1)
+
+# main.py logs through LOGGER, and selfcheck deliberately does not call
+# setup_logging (that writes into a real output directory). Without a handler its
+# warnings - including the reason tracking refused to start - go nowhere.
+logging.basicConfig(level=logging.INFO, format="    [main.py] %(levelname)s %(message)s")
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -126,7 +132,10 @@ def _start():
     main.TRACKER.start(cfg, {"gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available()
                              else "none", "selfcheck": True, "bf16_supported": True})
     if not main.TRACKER.enabled:
-        raise RuntimeError("TRACKER.start() did not enable tracking; see the log above")
+        raise RuntimeError(
+            main.TRACKER.last_error or "TRACKER.start() did not enable tracking, with no reason "
+            "recorded - which should not happen; re-run with VIMD_SELFCHECK_TRACE=1"
+        )
     main.TRACKER.config_update({"SELFCHECK": True, "note": "synthetic data, not a result"})
     url = getattr(main.TRACKER.run, "url", None)
     return f"run {main.TRACKER.run_id} -> {url or 'offline'}"
@@ -221,7 +230,11 @@ def _trainer():
     )
     names = [c.__class__.__name__ for c in trainer.callback_handler.callbacks]
     if "WandbCallback" not in names:
-        raise RuntimeError(f"WandbCallback did not attach; callbacks are {names}")
+        raise RuntimeError(
+            f"WandbCallback did not attach (callbacks are {names}). This follows from "
+            f"tracking being off, not from the Trainer: "
+            f"{main.TRACKER.last_error or 'no reason recorded'}"
+        )
     trainer.train()
 
     if wandb.run is not before:
@@ -261,8 +274,11 @@ def _stage45():
     wavs = list((run_dir / "media" / "audio").rglob("*.wav"))
     if len(wavs) < cfg.wandb_log_audio:
         raise RuntimeError(
-            f"expected {cfg.wandb_log_audio} audio clips, found {len(wavs)} - "
-            f"audio logging is broken again"
+            f"expected {cfg.wandb_log_audio} audio clips, found {len(wavs)}"
+            + (" - audio logging is broken again"
+               if main.TRACKER.enabled
+               else f" - but tracking is off, so this is a consequence: "
+                    f"{main.TRACKER.last_error or 'no reason recorded'}")
         )
     tables = list((run_dir / "media" / "table").rglob("*.json"))
     return (f"WER {report.wer_norm:.3f} over {report.num_pairs} utterances, "
@@ -277,7 +293,10 @@ def _artifact():
     main.TRACKER.artifact(f"selfcheck-{main.TRACKER.run_id}", "results", [payload],
                           metadata={"selfcheck": True})
     if not main.TRACKER.enabled:
-        raise RuntimeError("tracking switched itself off while uploading")
+        raise RuntimeError(
+            f"tracking switched itself off while uploading: "
+            f"{main.TRACKER.last_error or 'no reason recorded'}"
+        )
     return "queued"
 
 

@@ -730,6 +730,9 @@ class WandbRun:
         self.run: Any = None
         self.enabled: bool = False
         self.run_id: str = ""
+        # Why tracking is off, if it is. A swallowed exception that leaves no
+        # retrievable reason makes the failure undiagnosable from outside.
+        self.last_error: str = ""
 
     # -- lifecycle --------------------------------------------------------
     def start(self, cfg: Config, environment: Dict[str, Any]) -> None:
@@ -739,10 +742,8 @@ class WandbRun:
         try:
             import wandb
         except ImportError:
-            LOGGER.warning(
-                "VIMD_WANDB=1 but wandb is not installed (pip install wandb==0.22.3); "
-                "continuing without tracking"
-            )
+            self.last_error = "wandb is not installed (pip install wandb==0.22.3)"
+            LOGGER.warning("VIMD_WANDB=1 but %s; continuing without tracking", self.last_error)
             return
 
         # Keep every byte wandb writes inside the output directory, for the same
@@ -803,7 +804,8 @@ class WandbRun:
                 settings=wandb.Settings(init_timeout=120, login_timeout=30),
             )
         except BaseException as exc:  # noqa: BLE001 - tracking must never end a run
-            LOGGER.warning("wandb.init failed (%s); continuing without tracking", exc)
+            self.last_error = f"wandb.init failed: {exc.__class__.__name__}: {exc}"
+            LOGGER.warning("%s; continuing without tracking", self.last_error)
             self.run = None
             return
         self._wandb = wandb
@@ -875,8 +877,9 @@ class WandbRun:
         try:
             operation()
         except BaseException as exc:  # noqa: BLE001
+            self.last_error = f"{action} failed: {exc.__class__.__name__}: {exc}"
             LOGGER.warning(
-                "wandb %s failed (%s); tracking is off for the rest of this run", action, exc
+                "wandb %s; tracking is off for the rest of this run", self.last_error
             )
             self.enabled = False
 
