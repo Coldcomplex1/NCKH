@@ -115,16 +115,35 @@ cfg.dataloader_workers, cfg.early_stopping_patience = 0, 99
 cfg.wandb_log_samples, cfg.wandb_log_audio = 12, 4
 
 
-@check("W&B credentials resolve without a prompt")
+@check("W&B credentials are present AND the server accepts them")
 def _creds():
     if not cfg.wandb_enabled:
         raise RuntimeError("VIMD_WANDB is not 1, so there is nothing to check")
-    if main.WandbRun._has_credentials():
-        return f"key found for {main.WandbRun._api_host()} - this run will log live"
-    raise RuntimeError(
-        "no WANDB_API_KEY and no netrc entry. The run would record offline instead of "
-        "live. Fix with `wandb login`, or put the key in wandb.key next to run.sh."
-    )
+    if not main.WandbRun._has_credentials():
+        raise RuntimeError(
+            "no WANDB_API_KEY and no netrc entry. The run would record offline instead "
+            "of live. Fix with `wandb login`, or put the key in wandb.key next to run.sh."
+        )
+    # Presence is not validity, and checking only presence made a rejected key look
+    # like a Trainer problem four checks later. A revoked or mistyped key sits in
+    # netrc exactly like a good one and fails at the first API call with a 401.
+    import wandb
+    try:
+        # A bounded timeout: on a network that silently drops the connection rather
+        # than refusing it, the default retries turn this check into a hang, and a
+        # check that hangs is worse than one that fails.
+        viewer = wandb.Api(timeout=20).viewer
+    except BaseException as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"a key is present for {main.WandbRun._api_host()} but could not be confirmed "
+            f"(rejected, or the host unreachable): {exc.__class__.__name__}: {exc}\n"
+            f"        Re-enter it with `wandb login --relogin`, taking the key from "
+            f"https://wandb.ai/authorize .\n"
+            f"        If WANDB_API_KEY is set in this shell it wins over netrc - a stale "
+            f"one there is the usual cause."
+        ) from exc
+    who = getattr(viewer, "username", None) or getattr(viewer, "entity", None) or "?"
+    return f"accepted for {who} at {main.WandbRun._api_host()} - this run will log live"
 
 
 @check("a W&B run opens")
@@ -138,7 +157,10 @@ def _start():
         )
     main.TRACKER.config_update({"SELFCHECK": True, "note": "synthetic data, not a result"})
     url = getattr(main.TRACKER.run, "url", None)
-    return f"run {main.TRACKER.run_id} -> {url or 'offline'}"
+    if url:
+        return f"run {main.TRACKER.run_id} logging live -> {url}"
+    return (f"run {main.TRACKER.run_id} recording offline"
+            + (f" after: {main.TRACKER.last_error}" if main.TRACKER.last_error else ""))
 
 
 # ---------------------------------------------------------------------------

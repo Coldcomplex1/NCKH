@@ -786,28 +786,47 @@ class WandbRun:
 
         self.run_id = self._resolve_run_id(cfg)
         config = {**cfg.to_dict(), **{f"env/{k}": v for k, v in environment.items()}}
-        try:
-            self.run = wandb.init(
-                project=cfg.wandb_project,
-                entity=cfg.wandb_entity or None,
-                id=self.run_id,
-                resume="allow",  # the same id after a crash means one continuous run
-                mode=mode,
-                dir=str(cfg.output_dir),
-                name=cfg.wandb_run_name or f"{cfg.output_dir.name}-{self.run_id}",
-                notes=cfg.wandb_notes or None,
-                tags=[tag.strip() for tag in cfg.wandb_tags.split(",") if tag.strip()],
-                config=_json_safe(config),
-                # login_timeout is the second line of defence behind the credential
-                # check above: even a prompt reached by some path this misses gives up
-                # rather than holding the GPU idle until someone notices.
-                settings=wandb.Settings(init_timeout=120, login_timeout=30),
-            )
-        except BaseException as exc:  # noqa: BLE001 - tracking must never end a run
-            self.last_error = f"wandb.init failed: {exc.__class__.__name__}: {exc}"
-            LOGGER.warning("%s; continuing without tracking", self.last_error)
-            self.run = None
-            return
+        init_kwargs: Dict[str, Any] = dict(
+            project=cfg.wandb_project,
+            entity=cfg.wandb_entity or None,
+            id=self.run_id,
+            resume="allow",  # the same id after a crash means one continuous run
+            dir=str(cfg.output_dir),
+            name=cfg.wandb_run_name or f"{cfg.output_dir.name}-{self.run_id}",
+            notes=cfg.wandb_notes or None,
+            tags=[tag.strip() for tag in cfg.wandb_tags.split(",") if tag.strip()],
+            config=_json_safe(config),
+            # login_timeout is the second line of defence behind the credential check
+            # above: even a prompt reached by some path this misses gives up rather
+            # than holding the GPU idle until someone notices.
+            settings=wandb.Settings(init_timeout=120, login_timeout=30),
+        )
+
+        # An online init fails for reasons that have nothing to do with this run: a
+        # revoked or mistyped key (a 401 from upsertBucket), a proxy, a firewall,
+        # wandb.ai being down. Dropping tracking entirely then throws away the whole
+        # record of a twelve-hour job over something fixable afterwards, so fall back
+        # to recording locally and let it be synced once the cause is dealt with.
+        attempts = [mode] if mode != "online" else ["online", "offline"]
+        for attempt in attempts:
+            try:
+                self.run = wandb.init(mode=attempt, **init_kwargs)
+            except BaseException as exc:  # noqa: BLE001 - tracking must never end a run
+                self.last_error = f"wandb.init failed: {exc.__class__.__name__}: {exc}"
+                if attempt != attempts[-1]:
+                    LOGGER.warning("%s", self.last_error)
+                    LOGGER.warning(
+                        "falling back to offline recording so the run is still captured; "
+                        "fix the cause and upload afterwards with:\n    wandb sync %s",
+                        wandb_root / "offline-run-*",
+                    )
+                    continue
+                LOGGER.warning("%s; continuing without tracking", self.last_error)
+                self.run = None
+                return
+            mode = attempt
+            os.environ["WANDB_MODE"] = mode
+            break
         self._wandb = wandb
         self.enabled = True
         LOGGER.info(
