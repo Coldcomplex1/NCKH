@@ -155,12 +155,30 @@ and conflicts with the modern language/task API:
 | checkpoints retained | 3 | ~19 GB each. |
 | decoding during training | greedy | keeps the ~15 min validation loop affordable. |
 | decoding for selection & test | beam 5 | |
+| degenerate-hypothesis repair | detect, then re-decode only what is flagged | A handful of decoder repetition loops carried 4% of the test error budget. Detection is reference-free and the base decode is untouched, so every other hypothesis is bit-identical to a run without it. See §5. |
 | decode length cap | training evals: `min(448, max_train_label_tokens + 32)`; selection and test: **448** | a hard-coded 225 (a common default) would truncate long Vietnamese references. The training-eval cap is derived from the *training* labels only, so validation and test never influence the schedule; the passes that produce the reported scores use the model's own 448-token limit so no hypothesis is ever cut short. |
 | dataloader | 8 workers, pinned, persistent | log-mel extraction runs in the workers via torch STFT. |
 | seed | 42 | |
 
 Training-set filtering (applied to **train only** — never to valid or test): utterances with empty
 text, or whose tokenised label exceeds Whisper's 448-token decoder limit, are dropped and counted.
+
+**Named exclusions** are the one filter that does touch an evaluation split, and the bar is
+deliberately high: a row qualifies only when its audio and its reference do not describe the same
+speech, which is a property of the corpus that no decoder change can fix. `VIMD_EXCLUDE_UTTERANCES`
+lists them by filename; they are removed from **every** split before anything is summarised, decoded
+or scored, each removal is logged, and `final_results.json` names every one with its reason. The
+default list holds a single utterance:
+
+| Utterance | Split | Why |
+|---|---|---|
+| `77_0282.wav` | test, Bình Định, 21.8 s | The audio opens with roughly ten seconds of speech the ViMD reference does not contain, so the hypothesis can only match its tail. It scored 95% WER against a model that had transcribed it correctly. |
+
+So the reported test WER is a figure over **2,025** utterances, not 2,026 — which is why the count
+is in the results file beside the score. Set `VIMD_EXCLUDE_UTTERANCES=` (empty) to exclude nothing
+and score the corpus exactly as published. A name that matches no utterance aborts the run rather
+than being ignored: excluding nothing while the configuration says otherwise would misreport what
+the score is a score over.
 
 Utterances longer than 30 s (ViMD's maximum is 30.8 s) are truncated to Whisper's 30 s window by the
 feature extractor, never dropped. The count is reported in `final_results.json` under
@@ -209,6 +227,67 @@ references) and counted in `num_skipped_empty_references` rather than being sile
 Training targets are the **original** ViMD text — NFC and whitespace-collapsed only, with casing,
 punctuation and diacritics intact. Normalisation is a scoring step, not a training step.
 
+### Degenerate hypotheses
+
+Whisper's decoder occasionally latches onto a phrase and emits it until the 448-token cap. On the
+first full run three test utterances did this — `73_0332.wav` ended `"hội" ×110`, `81_0303.wav`
+`"được trồng cây này" ×34` — and between them they carried **4.0% of the entire test error budget**
+at per-utterance WER above 400%. Two more did it on validation. Nothing in beam search stops a beam
+re-entering the loop it just left, so these have to be noticed and re-decoded rather than hoped away.
+
+**Detection** reads the hypothesis and the audio duration and *nothing else*. It must never look at
+the reference: the repair below re-runs generation on whatever it flags, and a test that consulted
+the reference would be fitting the decoder to the test set. Two independent rules, each a
+conjunction so that neither fires on thin evidence:
+
+- **loop** — at least 48 words, at least half of them inside immediately-repeated word n-grams
+  (n ≤ 6) that repeat at least 4 times, and one run repeating at least 6 times. Half a transcript
+  inside a sixfold repetition is not speech at any rate, so this needs no corroboration. Coverage is
+  the *union* of every qualifying run, not the longest one: `73_0332.wav` is two consecutive runs,
+  and a loop that drifts fragments into several that a longest-run measure would let through.
+- **rate** — at least 48 words, an impossible word rate, **and** one of: weaker repetition, a zlib
+  compression ratio past 2.4 (Whisper's own loop threshold), or generation still running when it hit
+  the token cap. An implausible rate alone could be a dense transcript. This rule is the backstop for
+  a loop that drifts rather than repeating verbatim.
+
+Words are counted after the normalizer above (with digit expansion pinned off, so the verdict does
+not move with `VIMD_EXPAND_NUMBERS`). Normalising first is load-bearing rather than tidy: the loops
+emit `ủng hộ, ủng hộ`, and a raw `split()` compares `hộ,` against `hộ` and finds no repetition at
+all. The rate denominator is clamped to 30 s because that is all Whisper ever sees.
+
+The word-rate limit is derived from the **training split only**, as `max(6.0, 1.25 × p99.9)` of its
+words per second — the same discipline as the training-eval decode budget, so validation and test
+stay out of every decision made about them, and a percentile rather than a maximum so one misaligned
+training row cannot raise the bar above every loop.
+
+The thresholds are calibrated against the case that must *not* fire: `38_0284.wav` genuinely says
+`khi khi khi khi khi` — five unigram repeats at 12% coverage and 3.1 words/s — and is clean under
+both rules at every limit.
+
+**Repair** re-decodes only the flagged utterances, one at a time, up a ladder of escalating
+constraints. Everything else is returned untouched, so the reported score moves where the decoder
+had actually failed rather than because a blanket penalty was applied to two thousand utterances
+that did not need one.
+
+| Rung | Constraint |
+|---|---|
+| 1 | `no_repeat_ngram_size=6` — bans only long verbatim loops, so it is almost free of collateral damage |
+| 2 | `no_repeat_ngram_size=4` |
+| 3 | `no_repeat_ngram_size=3`, `repetition_penalty=1.15` |
+| 4 | + `length_penalty=0.8` — beam search then prefers finishing over filling the budget |
+| 5 | + the token budget itself cut to what the audio can hold, from train tokens-per-second |
+
+A rung is accepted the moment the detector clears its output, and not otherwise — the accept test
+never looks at the reference, so a repair cannot be rejected for being worse in WER and must not be.
+Nothing is sampled: a temperature fallback would make the reported score depend on an RNG. If no
+rung clears it, the **original** hypothesis is kept and the failure is recorded, because a
+hypothesis that was never validated must not reach the score. Repairs decode at batch size 1, so a
+repair does not depend on how many other rows happened to be flagged alongside it.
+
+`VIMD_REPAIR_DEGENERATE=0` is the dry run: the detector still flags, logs and reports, and every
+hypothesis is left exactly as it was decoded. `wer_normalized_before_repair` sits beside
+`wer_normalized` in `final_results.json` as the standing ablation.
+
 ---
 
 ## 6. Pipeline stages
@@ -216,10 +295,10 @@ punctuation and diacritics intact. Normalisation is a scoring step, not a traini
 | Stage | What it does |
 |---|---|
 | 1. Data preparation | Downloads, converts and deletes the 130 parquet shards one at a time into `data/vimd_16k/`. Resumable per shard. |
-| 2. Indexing | Memory-maps the shards, tokenises all references to find the label-length distribution and derive `generation_max_length`, filters the training split. |
+| 2. Indexing | Memory-maps the shards, applies any named exclusions, tokenises all references to find the label-length distribution, and derives from the *training* split alone the `generation_max_length`, the word-rate limit the degeneracy check uses and the token budget its last repair rung uses. Filters the training split. |
 | 3. Fine-tuning | `Seq2SeqTrainer` with generation-based validation WER every 250 steps and early stopping. |
-| 4. Checkpoint selection | Re-scores **every retained checkpoint** on validation with beam 5 — the final decoding config — rather than trusting the greedy ranking, and picks the lowest normalized WER. |
-| 5. Test | Decodes the test split once with the selected model and writes the results. |
+| 4. Checkpoint selection | Re-scores **every retained checkpoint** on validation with beam 5 — the final decoding config — rather than trusting the greedy ranking, and picks the lowest normalized WER. Degenerate hypotheses are counted for every candidate but repaired only for the winner: selection deliberately runs on the pre-repair metric, so adding the repair pass can neither change which checkpoint wins nor invalidate the test decode cache. |
+| 5. Test | Decodes the test split once with the selected model, repairs any degenerate hypotheses, and writes the results. |
 
 ---
 
@@ -241,6 +320,10 @@ outputs/
 ├── valid_rerank_cache.json     cached beam decodes, so an interruption during checkpoint
 │                               selection does not repeat an hour of decoding
 ├── test_decode_cache.json      the same, for the final test pass
+├── repair_cache.json           the re-decodes of degenerate hypotheses, keyed separately so a
+│                               change to the ladder or the thresholds costs nothing else
+├── training_complete.json      written when stage 3 finishes; a re-run re-scores the existing
+│                               checkpoints instead of resuming training into them
 ├── run_recipe.json             the recipe fingerprint this output directory belongs to
 ├── model_revision.json         the pinned PhoWhisper revision
 ├── wandb_run.json              the W&B run id this directory owns, so a restart resumes
@@ -254,10 +337,20 @@ outputs/
 
 Both CSVs carry: `index`, `filename`, `region`, `province_code`, `province_name`, `speakerID`,
 `gender`, `duration`, `reference`, `prediction`, `reference_normalized`, `prediction_normalized`,
-`wer_norm` (per utterance). They are written as `utf-8-sig` so Vietnamese renders correctly if
-opened directly in Excel.
+`wer_norm` (per utterance), then `repetition_rule`, `repair_rung` and
+`prediction_before_repair` — empty for every row the repair pass did not touch, so the
+before/after diff is one spreadsheet filter away. The three are **appended**, so anything that
+reads the original columns by position still works. Excluded utterances are absent from both
+files: they were removed before the split was decoded. The files are written as `utf-8-sig` so
+Vietnamese renders correctly if opened directly in Excel.
 
-`final_results.json` is the single file to read for the headline numbers.
+`final_results.json` is the single file to read for the headline numbers. Per split it carries
+`wer_normalized` (the headline: repaired, and over the rows that remained after any exclusion),
+`wer_normalized_before_repair` as the ablation, `num_utterances` for what the figure is a figure
+over, and a `degenerate_repair` block naming every flagged utterance, the rung that fixed it or
+that none did, and the share of the error budget they carried. At the top level,
+`excluded_utterances` names every removed row with its split, duration, province and reason, and
+`degenerate_repair_spec` records the thresholds and the ladder the run used.
 
 ---
 
@@ -280,22 +373,58 @@ and then failed on. Callback state is restored too
 (`restore_callback_states_from_checkpoint=True`) — without it the early-stopping patience counter
 would silently reset on every restart and let a plateaued run keep training.
 
+**A finished stage 3 stays finished.** `outputs/training_complete.json` is written once
+`trainer.train()` returns normally, and a later run that matches its training recipe skips stage 3
+entirely and re-scores the checkpoints already on disk. Without it, re-running a *finished*
+experiment — which is exactly what an evaluation-side change asks you to do — resumes from the last
+checkpoint and keeps training: early stopping does fire again, but only at the next evaluation,
+because `TrainerControl.should_training_stop` is the one piece of state `trainer_state.json` does
+not carry. That costs an `VIMD_EVAL_STEPS`-worth of GPU time and, worse, writes a checkpoint the
+original run never produced, which can then win stage 4 and change which model the experiment
+reports. The marker is checked against the newest checkpoint's `global_step` as well as the recipe,
+so one left by a shorter run cannot shortcut a longer one, and against the named best checkpoint
+still being on disk.
+
+An output directory produced before this marker existed does not have one. Write it by hand from
+values already on disk — `run_recipe.json` projected onto the training keys, the finished
+`global_step`, the epoch from `trainer_log_history.json`, the selected checkpoint path, the
+`best_greedy_wer_normalized_during_training` from `final_results.json`, and the batch size and
+accumulation — or accept the extra `VIMD_EVAL_STEPS` of training on the next run.
+
 **Completion and recipe identity.** The run computes a *recipe fingerprint* covering everything that
 changes what the result means: model id **and revision**, dataset id **and revision**, per-split
 content digests, learning rate, schedule, warmup, epochs, effective batch, SpecAugment, early
-stopping, beam count, the WER normalization setting, seed and a pipeline version. Per-device batch and accumulation are folded into the *effective* batch,
+stopping, beam count, the WER normalization setting, the exclusion list, the repair settings, seed
+and a pipeline version. Per-device batch and accumulation are folded into the *effective* batch,
 because the OOM back-off changes those two deliberately mid-run.
 
+That fingerprint answers two different questions, so it is compared two different ways.
+
 - `outputs/final_results.json` is the completion marker, written atomically and last. A restart exits
-  0 only if it parses, contains a test WER, **and** its stored recipe matches the current one. A
-  truncated file is moved to `final_results.json.damaged`; a file from a *different* configuration is
-  an error telling you to use a new `VIMD_OUTPUT_DIR` — it is neither reported as this run's result
-  nor silently overwritten.
-- `outputs/checkpoints/recipe.json` guards resume the same way. Changing the model, learning rate,
-  schedule or seed and restarting into an existing output directory aborts with a field-by-field diff
-  instead of resuming another experiment's weights. If checkpoints exist but that file is missing or
+  0 only if it parses, contains a test WER, **and** its stored **full** recipe matches the current
+  one. A truncated file is moved to `final_results.json.damaged`; a file from a *different*
+  configuration is an error — it is neither reported as this run's result nor silently overwritten.
+  The error says which kind of difference it is: when every changed field is evaluation-side it
+  tells you to move the earlier result aside and re-run, because the checkpoints are still valid
+  and nothing needs retraining; otherwise it tells you to use a new `VIMD_OUTPUT_DIR`.
+- `outputs/checkpoints/recipe.json` guards resume, and holds only the **training projection** of the
+  recipe: the part that determines the weights. Changing the model, learning rate, schedule or seed
+  and restarting into an existing output directory aborts with a field-by-field diff instead of
+  resuming another experiment's weights. If checkpoints exist but that file is missing or
   unreadable, the run aborts rather than writing the current recipe over the gap — weights that
   cannot be shown to belong to this configuration are never laundered into it.
+
+The projection is what makes an evaluation-side change affordable. Left out of it are the beam
+count, the exclusion list and the repair settings — stages 4 and 5 read those, and training
+evaluations are hardcoded greedy at `generation_num_beams=1` — along with the **test** split's
+content digest and utterance count, since nothing reads the test split before stage 5. The valid
+split stays in, because the greedy validation WER drives early stopping and therefore which
+checkpoints exist at all. Excluding a *train* or *valid* row needs no separate key: it already
+shows up through `train_used` and those splits' digests, which are in the projection.
+
+Both sides of the comparison are projected, and every key the projection keeps already existed, so
+a `recipe.json` written before the split — holding the whole recipe — still validates. Changing how
+a finished run is scored therefore re-decodes it; it never asks for the training to be repeated.
 
 Every file the next run reads back to decide what to skip is written temp-file → `fsync` →
 `os.replace`, with a temp name unique per process so two runs sharing a data directory cannot
@@ -308,6 +437,20 @@ per entry, a fingerprint of the exact weight files that produced it. A cache wri
 experiment in a reused output directory is discarded rather than mistaken for this one's.
 (`VIMD_EXPAND_NUMBERS` is deliberately *not* part of the key: it affects scoring only, and scores are
 always recomputed from cached hypotheses, so toggling it never throws away valid decoding.)
+
+The repair pass keeps its **own** cache under its own key, which is the decode key plus the ladder,
+the detector thresholds and the derived limits. A base decode does not depend on any of those — the
+repair is a second pass over a handful of utterances — so retuning the detector invalidates the
+repairs and nothing else. Within that cache each utterance is written as it is finished, because
+each repair is independent; an interruption resumes at the next one. Repairs are folded into the
+base hypotheses they were computed from, so a changed base decode can never be answered with
+repairs belonging to a different one.
+
+Alongside each cached hypothesis sits a flag for whether generation was still running when it hit
+the token cap, which the detector uses as corroborating evidence. It is absent from a cache written
+before the flag existed, where it reads as *unknown* rather than as false: a cached hypothesis is
+never re-decoded merely to learn how it ended, and since the cap is only ever corroborating, an
+older cache still catches every loop through the repetition rule.
 
 **Test decoding.** The test split is decoded once per selected checkpoint, with progress
 checkpointed as it goes. A crash — whether after the decode or halfway through it — resumes rather
@@ -382,6 +525,8 @@ Every tunable is settable without editing code. Defaults in brackets.
 | `VIMD_EARLY_STOPPING_PATIENCE` / `VIMD_EARLY_STOPPING_THRESHOLD` | [`5`] / [`5e-4`] |
 | `VIMD_SAVE_TOTAL_LIMIT` | checkpoints retained [`3`] |
 | `VIMD_FINAL_NUM_BEAMS` | beams for selection and test [`5`] |
+| `VIMD_EXCLUDE_UTTERANCES` | utterances removed from every split before decoding and scoring [`77_0282.wav`] — bare ViMD filenames, comma- or whitespace-separated. An explicitly empty value excludes nothing; a name matching no utterance aborts the run. |
+| `VIMD_REPAIR_DEGENERATE` | re-decode degenerate hypotheses [`1`]. `0` still flags, logs and reports them, but leaves every hypothesis as decoded — the dry run. |
 | `VIMD_SPEC_AUGMENT` | SpecAugment on/off [`1`] |
 | `VIMD_MASK_TIME_PROB` / `VIMD_MASK_TIME_LENGTH` | [`0.05`] / [`10`] |
 | `VIMD_MASK_FEATURE_PROB` / `VIMD_MASK_FEATURE_LENGTH` | [`0.0`] / [`10`] |

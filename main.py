@@ -79,6 +79,7 @@ import unicodedata
 import urllib.parse
 import uuid
 import wave
+import zlib
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -140,6 +141,17 @@ def _env_bool(name: str, default: bool) -> bool:
     )
 
 
+def _env_str_tuple(name: str, default: Sequence[str]) -> Tuple[str, ...]:
+    """Comma- or whitespace-separated list, sorted and de-duplicated so the recipe
+    fingerprint does not depend on the order someone typed the names in.
+
+    Unlike every other helper here, an explicitly EMPTY value means the empty list rather
+    than the default: turning a built-in entry off has to be sayable, and `VIMD_X=` is how."""
+    value = os.environ.get(name)
+    text = ",".join(default) if value is None else value
+    return tuple(sorted({item for item in re.split(r"[,\s]+", text.strip()) if item}))
+
+
 @dataclass
 class Config:
     # --- model / dataset -------------------------------------------------
@@ -172,6 +184,18 @@ class Config:
     early_stopping_patience: int = field(default_factory=lambda: _env_int("VIMD_EARLY_STOPPING_PATIENCE", 5))
     early_stopping_threshold: float = field(default_factory=lambda: _env_float("VIMD_EARLY_STOPPING_THRESHOLD", 5e-4))
     final_num_beams: int = field(default_factory=lambda: _env_int("VIMD_FINAL_NUM_BEAMS", 5))
+
+    # --- evaluation-side repair ------------------------------------------
+    # These change the reported score and nothing about the weights, which is why
+    # training_recipe_view keeps them out of the checkpoint marker.
+    exclude_utterances: Tuple[str, ...] = field(
+        default_factory=lambda: _env_str_tuple(
+            "VIMD_EXCLUDE_UTTERANCES", tuple(KNOWN_BAD_UTTERANCES)
+        )
+    )
+    repair_degenerate: bool = field(
+        default_factory=lambda: _env_bool("VIMD_REPAIR_DEGENERATE", True)
+    )
 
     # --- regularisation --------------------------------------------------
     apply_spec_augment: bool = field(default_factory=lambda: _env_bool("VIMD_SPEC_AUGMENT", True))
@@ -295,6 +319,14 @@ class Config:
                 f"sampling_rate must be 16000: Whisper's feature extractor and positional "
                 f"embeddings assume it. Got {self.sampling_rate}."
             )
+        for name in self.exclude_utterances:
+            # A path, a province name or a bare speaker id would match no record and abort
+            # later, in apply_exclusions; saying so here costs nothing and reads better.
+            if "/" in name or "\\" in name or not name.endswith(".wav"):
+                raise ValueError(
+                    f"VIMD_EXCLUDE_UTTERANCES entry {name!r} is not a ViMD filename. Entries "
+                    f"are bare names like 77_0282.wav, separated by commas or whitespace."
+                )
         if self.min_free_gb > self.recommended_free_gb:
             raise ValueError("VIMD_MIN_FREE_GB cannot exceed VIMD_RECOMMENDED_FREE_GB")
         if self.wandb_mode not in ("online", "offline", "disabled"):
@@ -319,6 +351,18 @@ METADATA_COLUMNS: Tuple[str, ...] = (
     "speakerID",
     "gender",
 )
+
+# Utterances whose ViMD audio and reference transcript do not describe the same speech,
+# found by hand in a finished run's per-utterance predictions. They are removed from their
+# split before anything is summarised, decoded or scored: left in, they measure the corpus's
+# alignment rather than the model's transcription, and no decoder change can fix them.
+# Overridable with VIMD_EXCLUDE_UTTERANCES, whose empty value means "exclude nothing".
+KNOWN_BAD_UTTERANCES: Dict[str, str] = {
+    # test/BinhDinh, 21.8 s: the audio opens with roughly ten seconds of speech the
+    # reference does not contain, so the hypothesis can only match its tail. Scored 95% WER
+    # against a model that had transcribed it correctly.
+    "77_0282.wav": "audio opens with speech the reference does not contain",
+}
 
 
 # ===========================================================================
@@ -486,7 +530,10 @@ def _digest(payload: Any) -> str:
 
 
 def recipe_fingerprint(
-    cfg: Config, dataset_fingerprint: Dict[str, Any], model_revision: str = ""
+    cfg: Config,
+    dataset_fingerprint: Dict[str, Any],
+    model_revision: str = "",
+    repair_spec: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Everything that changes what the produced model and score mean.
 
@@ -525,7 +572,83 @@ def recipe_fingerprint(
         "max_label_tokens": cfg.max_label_tokens,
         "seed": cfg.seed,
         "pipeline_version": PIPELINE_VERSION,
+        # Evaluation-side, all of them: they change the reported score without touching a
+        # weight, so training_recipe_view drops them and an existing checkpoint stays valid.
+        "exclude_utterances": sorted(cfg.exclude_utterances),
+        "repair_degenerate": cfg.repair_degenerate,
+        # A digest rather than the spec itself, so _describe_recipe_change stays readable.
+        "repair_spec_digest": _digest(repair_spec) if repair_spec else None,
+        "eval_pipeline_version": EVAL_PIPELINE_VERSION,
     }
+
+
+# What a checkpoint's weights and optimiser state actually depend on. The recipe keys left
+# out are read only by stages 4 and 5 - training evaluations are hardcoded greedy at
+# generation_num_beams=1 - so changing one has to re-score an existing checkpoint rather than
+# demand that it be trained again. expand_numbers stays IN: it decides eval_wer_norm, therefore
+# early stopping, therefore which checkpoints exist at all.
+TRAINING_RECIPE_KEYS: Tuple[str, ...] = (
+    "model_id",
+    "model_revision",
+    "dataset",
+    "language",
+    "task",
+    "expand_numbers",
+    "learning_rate",
+    "lr_scheduler_type",
+    "warmup_steps",
+    "num_train_epochs",
+    "effective_batch_size",
+    "weight_decay",
+    "max_grad_norm",
+    "apply_spec_augment",
+    "mask_time_prob",
+    "mask_time_length",
+    "mask_feature_prob",
+    "mask_feature_length",
+    "eval_steps",
+    "early_stopping_patience",
+    "early_stopping_threshold",
+    "max_label_tokens",
+    "seed",
+    "pipeline_version",
+)
+
+
+def dataset_fingerprint_without_test(fingerprint: Dict[str, Any]) -> Dict[str, Any]:
+    """A dataset fingerprint with the test split's entries dropped.
+
+    Nothing reads the test split before stage 5, so a difference confined to it cannot have
+    changed a weight - which makes this the test for "did the data that trained this model
+    change, or only the data it is being scored on?"."""
+    out = dict(fingerprint)
+    for section in ("utterances", "text_digest"):
+        values = out.get(section)
+        if isinstance(values, dict):
+            out[section] = {k: v for k, v in values.items() if k != "test"}
+    return out
+
+
+def training_recipe_view(recipe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Project a recipe onto the part that determines the weights.
+
+    A strict subset of the keys, plus dropping the test split from the dataset fingerprint:
+    nothing reads the test split before stage 5, so excluding a row from it must not
+    invalidate a checkpoint. The valid split stays, because the greedy validation WER drives
+    early stopping and therefore which checkpoints survive.
+
+    Every key kept here already existed and the projection is idempotent, so a recipe.json
+    written before this function did - holding the whole recipe - projects to exactly what is
+    written now. That is what lets an existing output directory resume instead of retraining.
+
+    Returns None when a key is missing, i.e. this is not a recipe this code can project; the
+    caller then treats the marker as unreadable rather than as a mismatch."""
+    if not isinstance(recipe, dict) or any(key not in recipe for key in TRAINING_RECIPE_KEYS):
+        return None
+    view = {key: recipe[key] for key in TRAINING_RECIPE_KEYS}
+    if isinstance(view.get("dataset"), dict):
+        view["dataset"] = dataset_fingerprint_without_test(view["dataset"])
+    return view
 
 
 def _describe_recipe_change(previous: Dict[str, Any], current: Dict[str, Any]) -> str:
@@ -1161,8 +1284,14 @@ def _retry(operation, description: str, attempts: int):
 
 # Bumped when the on-disk shard format changes, so an old cache is not silently reused.
 SHARD_FORMAT_VERSION = 2
-# Bumped when a change to this script would invalidate existing checkpoints or results.
+# Bumped when a change to this script would invalidate existing checkpoints. It is
+# deliberately NOT bumped for evaluation-side changes: those must re-score an existing
+# checkpoint, not demand that 50 GPU-hours be spent again. See training_recipe_view.
 PIPELINE_VERSION = 1
+# Bumped when a change to decoding or scoring would invalidate existing *results* while
+# leaving the weights valid. This is the escape hatch for such a change that no explicit
+# setting below captures.
+EVAL_PIPELINE_VERSION = 1
 
 
 def _shard_identity(cfg: Config, filename: str, revision: str) -> Dict[str, Any]:
@@ -2136,9 +2265,11 @@ def transcribe_dataset(
     batch_size: int,
     use_bf16: bool,
     description: str,
+    generate_overrides: Optional[Dict[str, Any]] = None,
     on_progress: Optional[Any] = None,
     resume_from: Optional[List[str]] = None,
-) -> List[str]:
+    resume_truncated: Optional[List[Optional[bool]]] = None,
+) -> Tuple[List[str], List[Optional[bool]]]:
     """Decode a split in dataset order, halving the batch size on CUDA OOM.
 
     Written explicitly rather than via Trainer.predict so the mapping from hypothesis to
@@ -2147,19 +2278,40 @@ def transcribe_dataset(
     `resume_from` supplies hypotheses already decoded for the leading utterances, and
     `on_progress` is called periodically with the full prefix so far, which together let
     a crash part-way through a long beam-search pass pick up where it stopped instead of
-    starting the split again."""
+    starting the split again.
+
+    `generate_overrides` is merged last into generate(), and is how the repair pass retries a
+    degenerate hypothesis under a harder constraint. It defaults to None so the ordinary pass
+    calls generate() with exactly the arguments it always has: the base hypotheses have to stay
+    bit-identical, and that is worth guaranteeing structurally rather than by argument.
+
+    Returns the hypotheses and, per hypothesis, whether generation was still running when it
+    hit the token cap - the corroborating signal for detect_degenerate. Entries are None for
+    utterances supplied through `resume_from` without a matching `resume_truncated`, meaning
+    unknown: a cached hypothesis is never re-decoded merely to learn how it ended."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     model.to(device)
     model.eval()
+    # Whisper uses the same id for pad and eos, which is exactly why "does this row contain
+    # eos" cannot say whether it finished, and the last column can - see the cap test below.
+    # A generation config may carry a list of stop ids rather than one; Whisper's carries a
+    # single <|endoftext|>, and taking the first keeps a stranger config from raising here.
+    eos_id = getattr(model.generation_config, "eos_token_id", None)
+    if isinstance(eos_id, (list, tuple)):
+        eos_id = eos_id[0] if eos_id else None
+    eos_id = int(eos_id if eos_id is not None else tokenizer.eos_token_id)
 
     done: List[str] = list(resume_from or [])
+    done_truncated: List[Optional[bool]] = list(resume_truncated or [])
     if len(done) > len(dataset):
-        done = []
+        done, done_truncated = [], []
+    if len(done_truncated) != len(done):
+        done_truncated = [None] * len(done)
     if done:
         LOGGER.info("  %s: resuming after %d/%d already decoded", description, len(done), len(dataset))
     if len(done) == len(dataset):
-        return done
+        return done, done_truncated
     remaining = dataset.select(range(len(done), len(dataset)))
 
     attempt_batch = max(1, batch_size)
@@ -2173,7 +2325,9 @@ def transcribe_dataset(
             pin_memory=True,
             worker_init_fn=_dataloader_worker_init,
         )
+        # Declared together inside the retry loop so an OOM back-off resets both in lockstep.
         hypotheses: List[str] = []
+        truncated: List[Optional[bool]] = []
         started = time.time()
         try:
             with torch.no_grad():
@@ -2193,11 +2347,21 @@ def transcribe_dataset(
                             language=cfg.language,
                             task=cfg.task,
                             return_timestamps=False,
+                            **(generate_overrides or {}),
                         )
                     hypotheses.extend(
                         text.strip()
                         for text in tokenizer.batch_decode(generated, skip_special_tokens=True)
                     )
+                    # A row stopped by the length criterion never had eos written, so its last
+                    # position holds a content token; a row that finished carries eos there, or
+                    # pad, which for Whisper is the same id. Beam search agrees: finalize()
+                    # appends eos only when the sequence came in under the cap. When no row
+                    # reached the cap the batch is shorter than it and the question is moot.
+                    if generated.shape[1] >= max_length:
+                        truncated.extend(bool(flag) for flag in (generated[:, -1] != eos_id).tolist())
+                    else:
+                        truncated.extend([False] * generated.shape[0])
                     if step % 20 == 0:
                         rate = len(hypotheses) / max(time.time() - started, 1e-6)
                         LOGGER.info(
@@ -2205,7 +2369,7 @@ def transcribe_dataset(
                             description, len(done) + len(hypotheses), len(dataset), rate,
                         )
                         if on_progress is not None:
-                            on_progress(done + hypotheses)
+                            on_progress(done + hypotheses, done_truncated + truncated)
             if len(hypotheses) != len(remaining):
                 raise RuntimeError(
                     f"decoded {len(hypotheses)} hypotheses for {len(remaining)} utterances"
@@ -2214,7 +2378,7 @@ def transcribe_dataset(
                 "  %s: done, %d utterances in %.0fs", description, len(hypotheses),
                 time.time() - started,
             )
-            return done + hypotheses
+            return done + hypotheses, done_truncated + truncated
         except BaseException as exc:  # noqa: BLE001
             if not _is_oom(exc) or attempt >= cfg.oom_retries or attempt_batch == 1:
                 raise
@@ -2222,6 +2386,542 @@ def transcribe_dataset(
             attempt_batch = max(1, attempt_batch // 2)
             LOGGER.warning("OOM while decoding; retrying with batch size %d", attempt_batch)
     raise RuntimeError("decoding failed")
+
+
+# ---------------------------------------------------------------------------
+# Degenerate hypotheses
+# ---------------------------------------------------------------------------
+#
+# Whisper's decoder occasionally latches onto a phrase and emits it until the token cap. On a
+# finished run three test utterances did this and, between them, carried 4.0% of the entire
+# error budget: 73_0332.wav ended "hoi" x110, 81_0303.wav "duoc trong cay nay" x34, each at a
+# per-utterance WER above 400%. Beam search has nothing stopping it from re-entering the loop,
+# so the fix is to notice and re-decode rather than to hope.
+#
+# The test below reads the hypothesis and the audio duration and NOTHING ELSE. It must never
+# look at the reference: the repair pass re-runs generation on whatever it flags, and a test
+# that consulted the reference would be fitting the decoder to the test set.
+
+DEGENERACY: Dict[str, Any] = {
+    "max_ngram": 6,            # longest word n-gram checked for immediate repetition
+    "min_repeats": 4,          # a run must repeat this often to count toward coverage
+    "min_words": 48,           # below this a "loop" is short enough to be real speech
+    "loop_coverage": 0.50,     # rule 1: share of the words inside qualifying runs
+    "loop_min_repeats": 6,     # rule 1: and one run must repeat at least this often
+    "rate_coverage": 0.25,     # rule 2: weaker repetition evidence...
+    "compression_ratio": 2.4,  # rule 2: ...or zlib ratio (Whisper's own loop threshold)
+    "word_rate_floor": 6.0,    # rule 2: words/s, never below this however tame train looks
+    "word_rate_margin": 1.25,  # rule 2: x this above the train p99.9
+}
+
+
+@dataclass
+class DegeneracyVerdict:
+    """Why a hypothesis reads as a decoder loop rather than as a transcription."""
+
+    degenerate: bool
+    rule: str                     # "loop" | "rate" | "" when clean
+    num_words: int
+    words_per_second: float
+    coverage: float               # union of qualifying runs / num_words
+    longest_unit: str             # the phrase that repeats most, "" when none does
+    longest_ngram: int
+    longest_repeats: int
+    compression_ratio: float
+    at_token_cap: Optional[bool]  # None when the hypothesis came from a cache with no flag
+
+    def summary(self) -> str:
+        parts = [f"{self.num_words} words ({self.words_per_second:.1f}/s)"]
+        if self.longest_repeats > 1:
+            parts.append(f'"{self.longest_unit}" x{self.longest_repeats}')
+            parts.append(f"coverage {self.coverage * 100:.0f}%")
+        parts.append(f"zlib {self.compression_ratio:.1f}")
+        if self.at_token_cap:
+            parts.append("at cap")
+        return ", ".join(parts)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "degenerate": self.degenerate,
+            "rule": self.rule,
+            "num_words": self.num_words,
+            "words_per_second": round(self.words_per_second, 3),
+            "coverage": round(self.coverage, 4),
+            "repeated_unit": self.longest_unit,
+            "repeated_ngram": self.longest_ngram,
+            "repeats": self.longest_repeats,
+            "compression_ratio": round(self.compression_ratio, 3),
+            "at_token_cap": self.at_token_cap,
+        }
+
+
+def _repeated_runs(
+    words: Sequence[str], max_ngram: int, min_repeats: int
+) -> Tuple[float, str, int, int]:
+    """(coverage, unit, n, repeats) for immediately-repeated word n-grams.
+
+    coverage is the share of words inside ANY run repeating at least min_repeats times, unioned
+    over every n - not the longest run alone. 73_0332.wav is two consecutive runs ("ung ho" x26
+    and then "hoi" x110), and a loop that drifts fragments into several sub-threshold runs that
+    a longest-run metric would let through. The unit, n and repeats describe the single longest
+    run, for the log. O(len(words) x max_ngram)."""
+    total = len(words)
+    if total == 0:
+        return 0.0, "", 0, 0
+    covered = [False] * total
+    best_span, best = 0, ("", 0, 0)
+    for size in range(1, max(1, max_ngram) + 1):
+        start = 0
+        while start + size <= total:
+            block = words[start:start + size]
+            repeats = 1
+            while (
+                start + (repeats + 1) * size <= total
+                and words[start + repeats * size:start + (repeats + 1) * size] == block
+            ):
+                repeats += 1
+            if repeats >= min_repeats:
+                span = repeats * size
+                for position in range(start, start + span):
+                    covered[position] = True
+                if span > best_span:
+                    best_span, best = span, (" ".join(block), size, repeats)
+            # A run starting inside the one just measured is a suffix of it at this n, so
+            # skipping to its end cannot miss a longer run.
+            start += repeats * size if repeats > 1 else 1
+    return sum(covered) / total, best[0], best[1], best[2]
+
+
+def detect_degenerate(
+    hypothesis: str,
+    duration: float,
+    word_rate_limit: float,
+    at_token_cap: Optional[bool] = None,
+    max_audio_seconds: float = 30.0,
+    spec: Dict[str, Any] = DEGENERACY,
+) -> DegeneracyVerdict:
+    """Two independent sufficient rules, each a conjunction so neither fires on thin evidence:
+
+      loop  enough words, half of them inside a >=6x immediate repetition. That is not speech
+            at any rate, so it needs no corroboration.
+
+      rate  enough words, an impossible word rate, AND one of: weaker repetition, a zlib ratio
+            past Whisper's own loop threshold, or generation still running at the token cap.
+            An implausible rate alone could be a dense transcript. This rule is the backstop
+            for a loop that drifts rather than repeating verbatim.
+
+    Words come from normalize_for_wer(..., expand_numbers=False). Normalising is not optional:
+    the loops emit "ung ho, ung ho", and a raw split() compares "ho," against "ho" and finds no
+    repetition at all. Pinning expand_numbers keeps the verdict independent of
+    VIMD_EXPAND_NUMBERS, for the same reason the decode signature omits it.
+
+    The rate denominator is clamped to max_audio_seconds because Whisper only ever sees the
+    first 30 s; the untruncated duration would understate the rate for the longest utterances."""
+    words = normalize_for_wer(hypothesis, expand_numbers=False).split()
+    num_words = len(words)
+    span = max(min(float(duration), max_audio_seconds), 1e-6)
+    words_per_second = num_words / span
+
+    encoded = hypothesis.encode("utf-8")
+    compression_ratio = (
+        len(encoded) / max(len(zlib.compress(encoded, 9)), 1) if encoded else 0.0
+    )
+    coverage, unit, ngram, repeats = _repeated_runs(
+        words, spec["max_ngram"], spec["min_repeats"]
+    )
+
+    rule = ""
+    if num_words >= spec["min_words"]:
+        if coverage >= spec["loop_coverage"] and repeats >= spec["loop_min_repeats"]:
+            rule = "loop"
+        elif words_per_second >= word_rate_limit and (
+            coverage >= spec["rate_coverage"]
+            or compression_ratio >= spec["compression_ratio"]
+            or at_token_cap is True
+        ):
+            rule = "rate"
+
+    return DegeneracyVerdict(
+        degenerate=bool(rule),
+        rule=rule,
+        num_words=num_words,
+        words_per_second=words_per_second,
+        coverage=coverage,
+        longest_unit=unit,
+        longest_ngram=ngram,
+        longest_repeats=repeats,
+        compression_ratio=compression_ratio,
+        at_token_cap=at_token_cap,
+    )
+
+
+def _p999(values: Sequence[float], fallback: float) -> float:
+    """The 99.9th percentile, or `fallback` when there is nothing to take it of.
+
+    A percentile rather than the maximum, so one misaligned row - the training-split analogue
+    of the utterances in KNOWN_BAD_UTTERANCES - cannot raise a limit above every loop."""
+    return float(np.percentile(np.asarray(values, dtype=np.float64), 99.9)) if values else fallback
+
+
+def train_word_rate_limit(dataset: ViMDDataset, spec: Dict[str, Any] = DEGENERACY) -> float:
+    """A words-per-second figure no real utterance in this corpus reaches.
+
+    Derived from TRAIN only, for the same reason the training-eval decode budget is: valid and
+    test stay out of every decision made about them."""
+    rates = [
+        len(normalize_for_wer(record["text"], expand_numbers=False).split())
+        / max(min(float(record["duration"]), 30.0), 1e-6)
+        for record in dataset.records
+        if str(record.get("text", "")).strip()
+    ]
+    return max(
+        float(spec["word_rate_floor"]),
+        float(spec["word_rate_margin"]) * _p999(rates, spec["word_rate_floor"]),
+    )
+
+
+def train_token_rate_cap(
+    dataset: ViMDDataset, label_lengths: Sequence[int], margin: float = 1.5
+) -> float:
+    """Label tokens per second that no real utterance in this corpus reaches - the budget the
+    last repair rung cuts generation down to. Train-derived for the same reason as above."""
+    rates = [
+        length / max(min(float(record["duration"]), 30.0), 1e-6)
+        for record, length in zip(dataset.records, label_lengths)
+        if length > 0
+    ]
+    return margin * _p999(rates, 16.0)
+
+
+# Escalating, deterministic, and never sampled: a temperature fallback would make the reported
+# score depend on an RNG. Each rung is tried on the flagged utterance alone and accepted the
+# moment detect_degenerate clears it; if every rung stays degenerate the ORIGINAL hypothesis is
+# kept, because a hypothesis that was never validated must not reach the score.
+REPAIR_LADDER: Tuple[Dict[str, Any], ...] = (
+    # Bans only long verbatim loops. A legitimate repeated 6-gram is vanishingly rare, so this
+    # rung is almost free of collateral damage - which is why it is first.
+    {"no_repeat_ngram_size": 6},
+    {"no_repeat_ngram_size": 4},
+    {"no_repeat_ngram_size": 3, "repetition_penalty": 1.15},
+    # length_penalty below 1 makes beam search prefer finishing over filling the budget.
+    {"no_repeat_ngram_size": 3, "repetition_penalty": 1.35, "length_penalty": 0.8},
+    # Last resort, and the one rung that cannot fail to shorten: the budget itself is cut to
+    # what the audio can plausibly hold. A loop is truncated rather than merely discouraged.
+    {"no_repeat_ngram_size": 3, "repetition_penalty": 1.35, "cap_to_duration": True},
+)
+# Bumped when a change to the ladder or to the repair procedure is not captured by the values
+# above; it is part of the repair cache signature.
+REPAIR_VERSION = 1
+
+
+@dataclass
+class RepairOutcome:
+    index: int
+    filename: str
+    duration: float
+    before: str
+    after: str
+    rung: int                   # 1-based; -1 when every rung stayed degenerate
+    overrides: Dict[str, Any]
+    verdict_before: DegeneracyVerdict
+    verdict_after: DegeneracyVerdict
+
+    @property
+    def repaired(self) -> bool:
+        return self.rung > 0
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "filename": self.filename,
+            "duration": round(self.duration, 3),
+            "repaired": self.repaired,
+            "rung": self.rung,
+            "overrides": self.overrides,
+            "before": self.before,
+            "after": self.after,
+            "verdict_before": self.verdict_before.to_json(),
+            "verdict_after": self.verdict_after.to_json(),
+        }
+
+
+def flag_degenerate(
+    dataset: ViMDDataset,
+    hypotheses: Sequence[str],
+    truncated: Sequence[Optional[bool]],
+    word_rate_limit: float,
+    cfg: Config,
+) -> List[Tuple[int, DegeneracyVerdict]]:
+    """Every hypothesis that reads as a decoder loop, with the verdict that flagged it."""
+    flagged: List[Tuple[int, DegeneracyVerdict]] = []
+    for index, hypothesis in enumerate(hypotheses):
+        record = dataset.records[index]
+        verdict = detect_degenerate(
+            hypothesis,
+            float(record.get("duration", 0.0)),
+            word_rate_limit,
+            truncated[index] if index < len(truncated) else None,
+            cfg.max_audio_seconds,
+        )
+        if verdict.degenerate:
+            flagged.append((index, verdict))
+    return flagged
+
+
+def degenerate_error_share(report: WerReport, indices: Sequence[int]) -> float:
+    """Share of the corpus's word errors contributed by these utterances.
+
+    Recovered from the report rather than recomputed: per-utterance WER times the reference
+    length is that utterance's edit count, and the corpus WER is the ratio of the sums."""
+    edits = [
+        (wer * len(ref.split())) if wer is not None else 0.0
+        for wer, ref in zip(report.per_utterance_wer, report.normalized_refs)
+    ]
+    total = sum(edits)
+    if total <= 0:
+        return 0.0
+    return float(sum(edits[index] for index in indices if index < len(edits)) / total)
+
+
+def repair_degenerate(
+    model,
+    dataset: ViMDDataset,
+    hypotheses: Sequence[str],
+    flagged: Sequence[Tuple[int, DegeneracyVerdict]],
+    collator: WhisperCollator,
+    tokenizer,
+    cfg: Config,
+    num_beams: int,
+    max_length: int,
+    token_rate_cap: float,
+    word_rate_limit: float,
+    use_bf16: bool,
+    description: str,
+    cache: Dict[str, Any],
+    cache_path: Path,
+    signature: Dict[str, Any],
+    cache_key: str,
+    weights_fingerprint: str,
+) -> Tuple[List[str], List[RepairOutcome]]:
+    """Re-decode only the hypotheses that came back as decoder loops.
+
+    Every other hypothesis is returned untouched, so the reported score moves only where the
+    decoder had actually failed - not because a blanket penalty was applied to two thousand
+    utterances that did not need one.
+
+    batch_size=1 throughout. The flagged set is a handful of rows, so the cost is seconds, and
+    it buys a property a batched pass cannot: a repair does not depend on how many other rows
+    happened to be flagged alongside it, which under bf16 reductions it otherwise would."""
+    repaired = list(hypotheses)
+    if not flagged or not cfg.repair_degenerate:
+        return repaired, []
+
+    # Folding the base hypotheses into the fingerprint means a changed base decode can never be
+    # answered with repairs computed for a different one.
+    fingerprint = _digest(
+        {
+            "weights": weights_fingerprint,
+            "flagged": [
+                [index, str(dataset.records[index].get("filename", index)), hypotheses[index]]
+                for index, _ in flagged
+            ],
+        }
+    )
+    entry = cache.get(cache_key)
+    stored: Dict[str, Any] = {}
+    if isinstance(entry, dict) and entry.get("fingerprint") == fingerprint:
+        candidate = entry.get("repairs")
+        if isinstance(candidate, dict):
+            stored = dict(candidate)
+
+    outcomes: List[RepairOutcome] = []
+    for index, verdict in flagged:
+        record = dataset.records[index]
+        filename = str(record.get("filename") or f"index-{index}")
+        # Keyed by position as well as name. Nothing in ViMD guarantees filenames are unique
+        # across shards, and two flagged rows sharing one would otherwise have the first row's
+        # repair served to the second - silently, and as a wrong hypothesis in the score.
+        cache_entry_key = f"{index}:{filename}"
+        duration = float(record.get("duration", 0.0))
+        LOGGER.warning("  %s %s %.1fs %s", description, filename, duration, verdict.summary())
+
+        cached = stored.get(cache_entry_key)
+        if isinstance(cached, dict) and isinstance(cached.get("after"), str):
+            after = cached["after"]
+            rung = int(cached.get("rung", -1))
+            overrides = cached.get("overrides") if isinstance(cached.get("overrides"), dict) else {}
+            after_cap = cached.get("after_at_cap")
+        else:
+            after, rung, overrides, after_cap = hypotheses[index], -1, {}, verdict.at_token_cap
+            single = dataset.select([index])
+            for rung_index, rung_spec in enumerate(REPAIR_LADDER, start=1):
+                attempt_overrides = dict(rung_spec)
+                attempt_max_length = max_length
+                if attempt_overrides.pop("cap_to_duration", False):
+                    attempt_max_length = max(
+                        32,
+                        min(
+                            max_length,
+                            int(math.ceil(token_rate_cap * min(duration, cfg.max_audio_seconds))),
+                        ),
+                    )
+                texts, caps = transcribe_dataset(
+                    model=model,
+                    dataset=single,
+                    collator=collator,
+                    tokenizer=tokenizer,
+                    cfg=cfg,
+                    num_beams=num_beams,
+                    max_length=attempt_max_length,
+                    batch_size=1,
+                    use_bf16=use_bf16,
+                    description=f"{description} repair {filename} rung {rung_index}",
+                    generate_overrides=attempt_overrides,
+                )
+                attempt_verdict = detect_degenerate(
+                    texts[0], duration, word_rate_limit, caps[0], cfg.max_audio_seconds
+                )
+                if not attempt_verdict.degenerate:
+                    after, rung, after_cap = texts[0], rung_index, caps[0]
+                    overrides = dict(rung_spec)
+                    if "cap_to_duration" in overrides:
+                        overrides["max_length"] = attempt_max_length
+                    break
+
+            stored[cache_entry_key] = {
+                "after": after,
+                "rung": rung,
+                "overrides": overrides,
+                "after_at_cap": after_cap,
+            }
+            # Written per utterance: each repair is independent, so an interruption resumes at
+            # the next one rather than redoing the split.
+            cache[cache_key] = {
+                "fingerprint": fingerprint,
+                "repairs": stored,
+                "complete": False,
+            }
+            _save_decode_cache(cache_path, signature, cache)
+
+        after_verdict = detect_degenerate(
+            after, duration, word_rate_limit, after_cap, cfg.max_audio_seconds
+        )
+        repaired[index] = after
+        outcomes.append(
+            RepairOutcome(
+                index=index,
+                filename=filename,
+                duration=duration,
+                before=hypotheses[index],
+                after=after,
+                rung=rung,
+                overrides=overrides,
+                verdict_before=verdict,
+                verdict_after=after_verdict,
+            )
+        )
+        if rung > 0:
+            LOGGER.warning(
+                "    -> rung %d %s: %s", rung, json.dumps(overrides, sort_keys=True),
+                after_verdict.summary(),
+            )
+        else:
+            LOGGER.warning(
+                "    -> no rung cleared it; keeping the original hypothesis (%s)",
+                after_verdict.summary(),
+            )
+
+    cache[cache_key] = {"fingerprint": fingerprint, "repairs": stored, "complete": True}
+    _save_decode_cache(cache_path, signature, cache)
+    return repaired, outcomes
+
+
+def _run_repair(
+    *,
+    model,
+    dataset: ViMDDataset,
+    hypotheses: Sequence[str],
+    flagged: Sequence[Tuple[int, DegeneracyVerdict]],
+    report: WerReport,
+    collator: WhisperCollator,
+    tokenizer,
+    cfg: Config,
+    max_length: int,
+    token_rate_cap: float,
+    word_rate_limit: float,
+    use_bf16: bool,
+    description: str,
+    cache: Dict[str, Any],
+    cache_path: Path,
+    signature: Dict[str, Any],
+    cache_key: str,
+    weights_fingerprint: str,
+) -> Tuple[List[str], List[RepairOutcome]]:
+    """Say what a split's degenerate hypotheses are costing it, then repair them.
+
+    The cost is worth logging even when the repair is switched off: VIMD_REPAIR_DEGENERATE=0
+    is the dry run that lets the flagged set be reviewed before any hypothesis changes."""
+    if not flagged:
+        LOGGER.info("%s: no degenerate hypotheses among %d", description, len(hypotheses))
+        return list(hypotheses), []
+
+    share = degenerate_error_share(report, [index for index, _ in flagged])
+    LOGGER.warning(
+        "%s: %d of %d hypotheses degenerate, carrying %.2f%% of the error budget",
+        description, len(flagged), len(hypotheses), share * 100.0,
+    )
+    if not cfg.repair_degenerate:
+        LOGGER.warning(
+            "  VIMD_REPAIR_DEGENERATE=0: flagged and reported only, every hypothesis left as "
+            "it was decoded"
+        )
+        for index, verdict in flagged:
+            LOGGER.warning(
+                "  %s %s %s", description,
+                dataset.records[index].get("filename", index), verdict.summary(),
+            )
+        return list(hypotheses), []
+
+    return repair_degenerate(
+        model=model,
+        dataset=dataset,
+        hypotheses=hypotheses,
+        flagged=flagged,
+        collator=collator,
+        tokenizer=tokenizer,
+        cfg=cfg,
+        num_beams=cfg.final_num_beams,
+        max_length=max_length,
+        token_rate_cap=token_rate_cap,
+        word_rate_limit=word_rate_limit,
+        use_bf16=use_bf16,
+        description=description,
+        cache=cache,
+        cache_path=cache_path,
+        signature=signature,
+        cache_key=cache_key,
+        weights_fingerprint=weights_fingerprint,
+    )
+
+
+def _repair_summary(
+    before: WerReport,
+    flagged: Sequence[Tuple[int, DegeneracyVerdict]],
+    repairs: Sequence[RepairOutcome],
+) -> Dict[str, Any]:
+    """What the degenerate hypotheses were and what became of them.
+
+    `flagged` rather than `repairs` decides the counts, so a dry run with the repair switched
+    off still reports what it found and what that found cost."""
+    return {
+        "num_flagged": len(flagged),
+        "num_repaired": sum(1 for outcome in repairs if outcome.repaired),
+        "num_unrepaired": len(flagged) - sum(1 for outcome in repairs if outcome.repaired),
+        "share_of_error_budget_before": round(
+            degenerate_error_share(before, [index for index, _ in flagged]), 6
+        ),
+        "utterances": [outcome.to_json() for outcome in repairs],
+    }
 
 
 # ===========================================================================
@@ -2242,6 +2942,10 @@ CSV_COLUMNS = (
     "reference_normalized",
     "prediction_normalized",
     "wer_norm",
+    # Appended rather than inserted, so a reader that indexes the original columns still works.
+    "repetition_rule",
+    "repair_rung",
+    "prediction_before_repair",
 )
 
 
@@ -2250,6 +2954,7 @@ def write_predictions_csv(
     dataset: ViMDDataset,
     hypotheses: Sequence[str],
     report: WerReport,
+    repairs: Optional[Dict[int, RepairOutcome]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # utf-8-sig so Vietnamese diacritics survive a double-click into Excel.
@@ -2258,6 +2963,7 @@ def write_predictions_csv(
         writer.writeheader()
         for index, record in enumerate(dataset.records):
             per_utterance = report.per_utterance_wer[index]
+            repair = (repairs or {}).get(index)
             writer.writerow(
                 {
                     "index": index,
@@ -2273,9 +2979,78 @@ def write_predictions_csv(
                     "reference_normalized": report.normalized_refs[index],
                     "prediction_normalized": report.normalized_hyps[index],
                     "wer_norm": "" if per_utterance is None else f"{per_utterance:.4f}",
+                    "repetition_rule": "" if repair is None else repair.verdict_before.rule,
+                    "repair_rung": (
+                        "" if repair is None
+                        else (str(repair.rung) if repair.repaired else "unrepaired")
+                    ),
+                    # Empty unless the hypothesis actually changed, so the before/after diff is
+                    # one spreadsheet filter away.
+                    "prediction_before_repair": (
+                        repair.before if repair is not None and repair.repaired else ""
+                    ),
                 }
             )
     LOGGER.info("wrote %s (%d rows)", path, len(dataset.records))
+
+
+def apply_exclusions(
+    splits: Dict[str, ViMDDataset], names: Sequence[str]
+) -> Tuple[Dict[str, ViMDDataset], List[Dict[str, Any]]]:
+    """Drop the named utterances from every split, before anything is summarised, decoded or
+    scored.
+
+    This is the one filter that touches an evaluation split, and it is deliberately narrow: a
+    row only qualifies when its audio and its reference do not describe the same speech, which
+    no decoder change can fix and which measures the corpus rather than the model. Each removal
+    is logged and lands in final_results.json, so the reported figure always says what it is a
+    figure over.
+
+    A name matching no record is an error rather than a no-op: a typo would otherwise leave the
+    bad row in the reported score while the configuration claimed it had been removed."""
+    if not names:
+        return splits, []
+
+    wanted = set(names)
+    removed: List[Dict[str, Any]] = []
+    filtered: Dict[str, ViMDDataset] = {}
+    for split, dataset in splits.items():
+        keep: List[int] = []
+        for index, record in enumerate(dataset.records):
+            filename = str(record.get("filename", ""))
+            if filename not in wanted:
+                keep.append(index)
+                continue
+            removed.append(
+                {
+                    "filename": filename,
+                    "split": split,
+                    "index": index,
+                    "duration": round(float(record.get("duration", 0.0)), 3),
+                    "region": record.get("region", ""),
+                    "province_name": record.get("province_name", ""),
+                    "reference": record.get("text", ""),
+                    "reason": KNOWN_BAD_UTTERANCES.get(filename, "listed in VIMD_EXCLUDE_UTTERANCES"),
+                }
+            )
+            LOGGER.warning(
+                "excluding %s[%d] %s (%s, %.1fs): %s",
+                split, index, filename, record.get("province_name", "?"),
+                float(record.get("duration", 0.0)), removed[-1]["reason"],
+            )
+        filtered[split] = dataset.select(keep) if len(keep) != len(dataset) else dataset
+
+    missing = sorted(wanted - {row["filename"] for row in removed})
+    if missing:
+        raise RuntimeError(
+            f"VIMD_EXCLUDE_UTTERANCES names {len(missing)} utterance(s) that are in no split: "
+            f"{', '.join(missing)}. Searched "
+            f"{sum(len(dataset) for dataset in splits.values())} records across "
+            f"{', '.join(sorted(splits))}. Excluding nothing while the configuration says "
+            f"otherwise would misreport what the score is a score over, so this is fatal; fix "
+            f"the name or set VIMD_EXCLUDE_UTTERANCES= to exclude nothing."
+        )
+    return filtered, removed
 
 
 def log_predictions_table(
@@ -2588,6 +3363,44 @@ def _validated_last_checkpoint(checkpoint_dir: Path) -> Optional[str]:
 # "checkpoint-1500" in a reused output directory can otherwise mean a different model,
 # a different dataset, or a different beam count.
 
+def _completed_training(cfg: Config, training_view: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A previous run in this directory that finished stage 3 for this exact training recipe.
+
+    Without this, a re-run of a finished experiment - to re-score it after an evaluation-side
+    change, which is the whole point of the training/scoring recipe split - resumes from the
+    last checkpoint and keeps training. Early stopping does fire again, but only at the next
+    evaluation: TrainerControl.should_training_stop is not part of trainer_state.json, so the
+    decision to stop is the one piece of state a resume cannot restore. That costs an
+    eval_steps' worth of GPU time and, worse, writes a checkpoint the previous run never
+    produced, which can then win stage 4 and change which model the experiment reports.
+
+    Checked against the newest checkpoint's step as well as the recipe, so a marker left by a
+    shorter run cannot shortcut a longer one, and against the named checkpoint still existing."""
+    marker = _read_json(cfg.output_dir / "training_complete.json")
+    if not isinstance(marker, dict) or marker.get("training_recipe") != training_view:
+        return None
+
+    best = marker.get("best_model_checkpoint")
+    if not isinstance(best, str) or not _checkpoint_is_complete(Path(best)):
+        LOGGER.warning(
+            "training_complete.json names %r, which is not a complete checkpoint; training "
+            "will be resumed instead of skipped", best,
+        )
+        return None
+
+    newest = _sorted_checkpoints(cfg.checkpoint_dir, newest_first=True)
+    state = _read_json(newest[0] / "trainer_state.json") if newest else None
+    newest_step = state.get("global_step") if isinstance(state, dict) else None
+    if newest_step != marker.get("global_step"):
+        LOGGER.warning(
+            "training_complete.json records step %r but the newest checkpoint is at step %r; "
+            "training will be resumed instead of skipped",
+            marker.get("global_step"), newest_step,
+        )
+        return None
+    return marker
+
+
 def _load_decode_cache(path: Path, signature: Dict[str, Any]) -> Dict[str, Any]:
     payload = _read_json(path)
     if payload is None:
@@ -2622,6 +3435,21 @@ def _cached_prefix(entries: Dict[str, Any], key: str, fingerprint: str, expected
     return hypotheses
 
 
+def _cached_truncated(entries: Dict[str, Any], key: str, count: int) -> List[Optional[bool]]:
+    """Per-hypothesis "generation was still running at the token cap" flags, where the cache
+    has them.
+
+    The key is absent from entries written before this check existed, and None there means
+    unknown rather than False: a cached hypothesis is never re-decoded merely to learn how it
+    ended, and the cap is only ever corroborating evidence for detect_degenerate, so an older
+    cache still catches every loop through the repetition rule."""
+    entry = entries.get(key)
+    flags = entry.get("truncated") if isinstance(entry, dict) else None
+    if not isinstance(flags, list) or len(flags) != count:
+        return [None] * count
+    return [flag if isinstance(flag, bool) else None for flag in flags]
+
+
 def _cached_hypotheses(
     entries: Dict[str, Any], key: str, fingerprint: str, expected: int
 ) -> Optional[List[str]]:
@@ -2640,24 +3468,39 @@ def _decode_with_cache(
     fingerprint: str,
     dataset: "ViMDDataset",
     decode: Any,
-) -> List[str]:
+) -> Tuple[List[str], List[Optional[bool]]]:
     """Return cached hypotheses when they are complete, otherwise decode the remainder
-    and keep the cache up to date as it goes."""
+    and keep the cache up to date as it goes.
+
+    The token-cap flags ride alongside the hypotheses. They are absent from a cache written
+    before they existed, in which case they come back as None - see _cached_truncated."""
     complete = _cached_hypotheses(cache, key, fingerprint, len(dataset))
     if complete is not None:
         LOGGER.info("  %s: reusing cached decode", key)
-        return complete
+        return complete, _cached_truncated(cache, key, len(dataset))
 
-    def store(prefix: List[str], done: bool = False) -> None:
-        cache[key] = {"fingerprint": fingerprint, "hypotheses": prefix, "complete": done}
+    def store(
+        prefix: List[str], flags: Optional[List[Optional[bool]]] = None, done: bool = False
+    ) -> None:
+        cache[key] = {
+            "fingerprint": fingerprint,
+            "hypotheses": prefix,
+            "truncated": list(flags or [None] * len(prefix)),
+            "complete": done,
+        }
         _save_decode_cache(cache_path, signature, cache)
 
-    hypotheses = decode(
+    prefix = _cached_prefix(cache, key, fingerprint, len(dataset))
+    hypotheses, truncated = decode(
         on_progress=store,
-        resume_from=_cached_prefix(cache, key, fingerprint, len(dataset)),
+        resume_from=prefix,
+        # Against the prefix's length, not the split's: a decode interrupted part-way stored
+        # flags for the utterances it had finished, and asking for the full split's worth would
+        # find a length mismatch and throw the ones it does have away.
+        resume_truncated=_cached_truncated(cache, key, len(prefix)),
     )
-    store(hypotheses, done=True)
-    return hypotheses
+    store(hypotheses, truncated, done=True)
+    return hypotheses, truncated
 
 
 def _checkpoint_candidates(checkpoint_dir: Path, best: Optional[str]) -> List[Path]:
@@ -2704,6 +3547,10 @@ def run(cfg: Config) -> int:
         )
         for split in SPLITS
     }
+    # Before anything is summarised, decoded or scored, so every figure below - the split
+    # summaries, the content digests, the decode caches - already describes what was measured.
+    splits, excluded_utterances = apply_exclusions(splits, cfg.exclude_utterances)
+
     summaries = {split: split_summary(dataset, cfg) for split, dataset in splits.items()}
     for split, summary in summaries.items():
         LOGGER.info("%-5s %s", split, json.dumps(summary, ensure_ascii=False))
@@ -2735,8 +3582,10 @@ def run(cfg: Config) -> int:
                 too_long, split, cfg.max_label_tokens,
             )
 
-    # Filtering applies to the training split only. Dropping an evaluation utterance
-    # would quietly change what the reported WER measures.
+    # Length and empty-text filtering applies to the training split only. Dropping an
+    # evaluation utterance for either reason would quietly change what the reported WER
+    # measures. The one filter that does touch an evaluation split is apply_exclusions above,
+    # which is narrow, named, logged and recorded in the results for exactly that reason.
     keep = [
         index
         for index, length in enumerate(label_lengths["train"])
@@ -2769,21 +3618,65 @@ def run(cfg: Config) -> int:
     }
     previous = _read_json(fingerprint_path)
     if isinstance(previous, dict) and previous != fingerprint:
-        LOGGER.warning(
-            "the dataset changed since the last run in this output directory:\n  before: %s\n"
-            "  now:    %s\nExisting checkpoints were trained on different data or a different "
-            "number of steps per epoch. For a clean run, delete %s.",
-            json.dumps(previous, ensure_ascii=False),
-            json.dumps(fingerprint, ensure_ascii=False),
-            cfg.checkpoint_dir,
-        )
+        if dataset_fingerprint_without_test(previous) == dataset_fingerprint_without_test(
+            fingerprint
+        ):
+            # What excluding a test utterance looks like. Telling someone to delete their
+            # checkpoints over it would be wrong, and they would probably do it.
+            LOGGER.info(
+                "the test split differs from the last run in this output directory (%s -> %s "
+                "utterances); nothing that trained the model changed, so the checkpoints stay "
+                "valid and only the test decode is redone",
+                (previous.get("utterances") or {}).get("test"),
+                fingerprint["utterances"].get("test"),
+            )
+        else:
+            LOGGER.warning(
+                "the dataset changed since the last run in this output directory:\n  before: %s\n"
+                "  now:    %s\nExisting checkpoints were trained on different data or a different "
+                "number of steps per epoch. For a clean run, delete %s.",
+                json.dumps(previous, ensure_ascii=False),
+                json.dumps(fingerprint, ensure_ascii=False),
+                cfg.checkpoint_dir,
+            )
     _write_json_atomic(fingerprint_path, fingerprint)
 
-    # The recipe is only fully known once the data is indexed, which is why the
-    # completion check lives here rather than at the top of the run: a finished run
-    # spends a couple of minutes re-verifying shards before exiting, and in exchange a
-    # changed configuration can never be answered with a previous experiment's result.
-    recipe = recipe_fingerprint(cfg, fingerprint, model_revision)
+    # Two decode budgets and two degeneracy limits, all four derived from the TRAINING split
+    # only: the periodic evaluations use a train-derived cap purely for speed, and deriving
+    # every limit from train keeps validation and test out of the decisions made about them.
+    # The scores that get reported come from the final passes, which use the model's own
+    # 448-token limit so a long valid/test hypothesis is never cut short.
+    train_eval_max_length = int(
+        max(64, min(cfg.max_label_tokens, (max(label_lengths["train"]) if label_lengths["train"] else 0) + 32))
+    )
+    final_max_length = cfg.max_label_tokens
+    LOGGER.info(
+        "generation max length: %d during training evals, %d for selection and test",
+        train_eval_max_length, final_max_length,
+    )
+    word_rate_limit = train_word_rate_limit(train_dataset)
+    token_rate_cap = train_token_rate_cap(
+        train_dataset, [label_lengths["train"][index] for index in keep]
+    )
+    LOGGER.info(
+        "degeneracy: flag a hypothesis above %.1f words/s; last repair rung budgets %.1f tokens/s",
+        word_rate_limit, token_rate_cap,
+    )
+    repair_spec: Optional[Dict[str, Any]] = None
+    if cfg.repair_degenerate:
+        repair_spec = {
+            "version": REPAIR_VERSION,
+            "detector": DEGENERACY,
+            "ladder": [dict(rung) for rung in REPAIR_LADDER],
+            "word_rate_limit": round(word_rate_limit, 4),
+            "token_rate_cap": round(token_rate_cap, 4),
+        }
+
+    # The recipe is only fully known once the data is indexed, which is why the completion
+    # check below lives here rather than at the top of the run: a finished run spends a couple
+    # of minutes re-verifying shards before exiting, and in exchange a changed configuration
+    # can never be answered with a previous experiment's result.
+    recipe = recipe_fingerprint(cfg, fingerprint, model_revision, repair_spec)
     _write_json_atomic(cfg.output_dir / "run_recipe.json", recipe)
 
     TRACKER.config_update({
@@ -2831,13 +3724,28 @@ def run(cfg: Config) -> int:
                 TRACKER.summary({"test/wer_norm": test_wer, "status": "already_complete"})
                 TRACKER.finish(0)
                 return 0
+            # An evaluation-side difference is the common case for a re-score, and the way
+            # out of it is not the same: the checkpoints in this directory are still valid,
+            # so there is nothing to retrain and nothing to move except the result itself.
+            previous_training = training_recipe_view(previous_recipe or {})
+            remedy = (
+                "Point VIMD_OUTPUT_DIR at a new directory for this configuration, or move the "
+                "existing outputs aside."
+            )
+            if previous_training is not None and previous_training == training_recipe_view(recipe):
+                remedy = (
+                    f"Every difference above is evaluation-side: the checkpoints in "
+                    f"{cfg.checkpoint_dir} are still valid for it and nothing needs retraining. "
+                    f"Move the earlier result aside and re-run to re-score them:\n"
+                    f"    mv {cfg.results_path} "
+                    f"{cfg.results_path.with_suffix('.superseded.json')}"
+                )
             raise RuntimeError(
                 f"{cfg.results_path} holds a finished result produced by a DIFFERENT "
                 f"configuration:\n"
                 f"{_describe_recipe_change(previous_recipe or {}, recipe)}\n"
                 f"Returning that number as this run's result would be wrong, and overwriting it "
-                f"would destroy the earlier experiment. Point VIMD_OUTPUT_DIR at a new directory "
-                f"for this configuration, or move the existing outputs aside."
+                f"would destroy the earlier experiment. {remedy}"
             )
         damaged = cfg.results_path.with_name(cfg.results_path.name + ".damaged")
         LOGGER.warning(
@@ -2849,17 +3757,21 @@ def run(cfg: Config) -> int:
     # Checkpoints carry optimiser state and weights for one specific recipe. Resuming
     # them under a changed model, learning rate, schedule or seed would silently produce
     # a model that matches neither configuration.
+    # Only the training projection, so an evaluation-side change re-scores these checkpoints
+    # instead of demanding that they be trained again. Projecting the stored marker too is what
+    # lets one written before this projection existed - holding the whole recipe - still match.
     recipe_marker = cfg.checkpoint_dir / "recipe.json"
-    stored_recipe = _read_json(recipe_marker)
+    training_view = training_recipe_view(recipe)
+    stored_recipe = training_recipe_view(_read_json(recipe_marker) or {})
     existing_checkpoints = [
         path for path in _sorted_checkpoints(cfg.checkpoint_dir) if _checkpoint_has_weights(path)
     ]
     if isinstance(stored_recipe, dict):
-        if stored_recipe != recipe:
+        if stored_recipe != training_view:
             if _validated_last_checkpoint(cfg.checkpoint_dir):
                 raise RuntimeError(
                     f"{cfg.checkpoint_dir} holds checkpoints trained with a different recipe:\n"
-                    f"{_describe_recipe_change(stored_recipe, recipe)}\n"
+                    f"{_describe_recipe_change(stored_recipe, training_view)}\n"
                     f"Resuming them would mix two experiments. Use a fresh VIMD_OUTPUT_DIR, or "
                     f"delete {cfg.checkpoint_dir} to start this configuration from scratch."
                 )
@@ -2876,20 +3788,7 @@ def run(cfg: Config) -> int:
             f"scratch, or restore the file if you know the checkpoints match."
         )
     cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    _write_json_atomic(recipe_marker, recipe)
-
-    # Two decode budgets. The periodic evaluations use a train-derived cap purely for
-    # speed; deriving it from train only keeps validation and test out of the decision.
-    # The scores that get reported come from the final passes, which use the model's
-    # own 448-token limit so a long valid/test hypothesis is never cut short.
-    train_eval_max_length = int(
-        max(64, min(cfg.max_label_tokens, (max(label_lengths["train"]) if label_lengths["train"] else 0) + 32))
-    )
-    final_max_length = cfg.max_label_tokens
-    LOGGER.info(
-        "generation max length: %d during training evals, %d for selection and test",
-        train_eval_max_length, final_max_length,
-    )
+    _write_json_atomic(recipe_marker, training_view)
 
     decoder_start_token_id = tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
     if decoder_start_token_id is None:
@@ -2912,87 +3811,121 @@ def run(cfg: Config) -> int:
     trainer: Optional[AutocastSeq2SeqTrainer] = None
     model: Optional[WhisperForConditionalGeneration] = None
 
-    for attempt in range(cfg.oom_retries + 1):
-        model = load_model(cfg, model_path, tokenizer=tokenizer)
-        trainer = build_seq2seq_trainer(
-            cfg=cfg,
-            model=model,
-            processor=processor,
-            train_dataset=train_dataset,
-            eval_dataset=valid_dataset,
-            collator=collator,
-            compute_metrics=compute_metrics,
-            callbacks=[
-                MetricsHistoryCallback(cfg.output_dir / "metrics_history.json"),
-                EarlyStoppingCallback(
-                    early_stopping_patience=cfg.early_stopping_patience,
-                    early_stopping_threshold=cfg.early_stopping_threshold,
-                ),
-            ],
-            train_batch_size=train_batch_size,
-            grad_accum=grad_accum,
-            eval_batch_size=eval_batch_size,
-            generation_max_length=train_eval_max_length,
-            use_bf16=use_bf16,
-            tf32=bool(environment["tf32_available"]),
-        )
-        resume_from = _validated_last_checkpoint(cfg.checkpoint_dir)
+    completed = _completed_training(cfg, training_view)
+    if completed is not None:
+        best_checkpoint = completed["best_model_checkpoint"]
+        best_greedy_wer = completed.get("best_metric")
+        train_batch_size = int(completed.get("per_device_train_batch_size", train_batch_size))
+        grad_accum = int(completed.get("gradient_accumulation_steps", grad_accum))
         LOGGER.info(
-            "batch %d x accum %d (effective %d), eval batch %d, resume from %s",
-            train_batch_size, grad_accum, train_batch_size * grad_accum, eval_batch_size,
-            resume_from or "scratch",
+            "training already complete at step %d (epoch %.2f); skipping stage 3 and re-scoring "
+            "the checkpoints already in %s",
+            int(completed.get("global_step", 0)), float(completed.get("epoch", 0.0)),
+            cfg.checkpoint_dir,
         )
-        try:
-            trainer.train(resume_from_checkpoint=resume_from)
-            break
-        except BaseException as exc:  # noqa: BLE001
-            if not _is_oom(exc) or attempt >= cfg.oom_retries or train_batch_size == 1:
-                raise
-            LOGGER.error("CUDA OOM during training: %s", exc)
-            del trainer, model
-            trainer, model = None, None
-            _free_cuda()
-            train_batch_size = max(1, train_batch_size // 2)
-            # Keep the effective batch constant so the recipe itself does not change.
-            grad_accum = max(1, effective_batch // train_batch_size)
-            eval_batch_size = max(1, eval_batch_size // 2)
-            LOGGER.warning(
-                "retrying with batch %d x accum %d, eval batch %d",
-                train_batch_size, grad_accum, eval_batch_size,
+        candidates = _checkpoint_candidates(cfg.checkpoint_dir, best_checkpoint)
+        history = _read_json(cfg.output_dir / "trainer_log_history.json")
+        log_history = history if isinstance(history, list) else []
+    else:
+        for attempt in range(cfg.oom_retries + 1):
+            model = load_model(cfg, model_path, tokenizer=tokenizer)
+            trainer = build_seq2seq_trainer(
+                cfg=cfg,
+                model=model,
+                processor=processor,
+                train_dataset=train_dataset,
+                eval_dataset=valid_dataset,
+                collator=collator,
+                compute_metrics=compute_metrics,
+                callbacks=[
+                    MetricsHistoryCallback(cfg.output_dir / "metrics_history.json"),
+                    EarlyStoppingCallback(
+                        early_stopping_patience=cfg.early_stopping_patience,
+                        early_stopping_threshold=cfg.early_stopping_threshold,
+                    ),
+                ],
+                train_batch_size=train_batch_size,
+                grad_accum=grad_accum,
+                eval_batch_size=eval_batch_size,
+                generation_max_length=train_eval_max_length,
+                use_bf16=use_bf16,
+                tf32=bool(environment["tf32_available"]),
             )
-            # Without this, the discontinuity the back-off leaves in the loss curve
-            # has no explanation on the dashboard.
-            TRACKER.summary({
-                "train/oom_backoffs": attempt + 1,
-                "train/per_device_train_batch_size": train_batch_size,
-                "train/gradient_accumulation_steps": grad_accum,
-                "train/eval_batch_size": eval_batch_size,
-            })
+            resume_from = _validated_last_checkpoint(cfg.checkpoint_dir)
+            LOGGER.info(
+                "batch %d x accum %d (effective %d), eval batch %d, resume from %s",
+                train_batch_size, grad_accum, train_batch_size * grad_accum, eval_batch_size,
+                resume_from or "scratch",
+            )
+            try:
+                trainer.train(resume_from_checkpoint=resume_from)
+                break
+            except BaseException as exc:  # noqa: BLE001
+                if not _is_oom(exc) or attempt >= cfg.oom_retries or train_batch_size == 1:
+                    raise
+                LOGGER.error("CUDA OOM during training: %s", exc)
+                del trainer, model
+                trainer, model = None, None
+                _free_cuda()
+                train_batch_size = max(1, train_batch_size // 2)
+                # Keep the effective batch constant so the recipe itself does not change.
+                grad_accum = max(1, effective_batch // train_batch_size)
+                eval_batch_size = max(1, eval_batch_size // 2)
+                LOGGER.warning(
+                    "retrying with batch %d x accum %d, eval batch %d",
+                    train_batch_size, grad_accum, eval_batch_size,
+                )
+                # Without this, the discontinuity the back-off leaves in the loss
+                # curve has no explanation on the dashboard.
+                TRACKER.summary({
+                    "train/oom_backoffs": attempt + 1,
+                    "train/per_device_train_batch_size": train_batch_size,
+                    "train/gradient_accumulation_steps": grad_accum,
+                    "train/eval_batch_size": eval_batch_size,
+                })
 
-    if trainer is None:
-        raise RuntimeError("training did not run")
+        if trainer is None:
+            raise RuntimeError("training did not run")
 
-    best_checkpoint = trainer.state.best_model_checkpoint
-    best_greedy_wer = trainer.state.best_metric
-    LOGGER.info(
-        "training finished at step %d; best greedy validation wer_norm=%.4f (%s)",
-        trainer.state.global_step,
-        best_greedy_wer if best_greedy_wer is not None else float("nan"),
-        best_checkpoint,
-    )
-    trainer.save_state()
-    candidates = _checkpoint_candidates(cfg.checkpoint_dir, best_checkpoint)
-    log_history = list(trainer.state.log_history)
+        best_checkpoint = trainer.state.best_model_checkpoint
+        best_greedy_wer = trainer.state.best_metric
+        LOGGER.info(
+            "training finished at step %d; best greedy validation wer_norm=%.4f (%s)",
+            trainer.state.global_step,
+            best_greedy_wer if best_greedy_wer is not None else float("nan"),
+            best_checkpoint,
+        )
+        trainer.save_state()
+        candidates = _checkpoint_candidates(cfg.checkpoint_dir, best_checkpoint)
+        log_history = list(trainer.state.log_history)
 
-    # Release optimiser, gradients and the training model before beam search.
-    try:
-        trainer.accelerator.free_memory()
-    except Exception:  # pragma: no cover - accelerate internals differ across versions
-        pass
-    trainer.optimizer = None
-    trainer.lr_scheduler = None
-    del trainer, model
-    _free_cuda()
+        # Written only once trainer.train() has returned normally, and read by
+        # _completed_training on the next run. TrainerControl.should_training_stop is not part
+        # of trainer_state.json, so without this a re-run resumes from the last checkpoint and
+        # trains a further eval_steps before early stopping fires again - hours of GPU time,
+        # and a new checkpoint that can win stage 4 and change which model the run reports.
+        _write_json_atomic(
+            cfg.output_dir / "training_complete.json",
+            {
+                "training_recipe": training_view,
+                "global_step": int(trainer.state.global_step),
+                "epoch": float(trainer.state.epoch or 0.0),
+                "best_model_checkpoint": best_checkpoint,
+                "best_metric": best_greedy_wer,
+                "per_device_train_batch_size": train_batch_size,
+                "gradient_accumulation_steps": grad_accum,
+            },
+        )
+
+        # Release optimiser, gradients and the training model before beam search.
+        try:
+            trainer.accelerator.free_memory()
+        except Exception:  # pragma: no cover - accelerate internals differ across versions
+            pass
+        trainer.optimizer = None
+        trainer.lr_scheduler = None
+        del trainer, model
+        _free_cuda()
 
     # ---- stage 4: checkpoint selection ----------------------------------
     banner("Stage 4/5 - checkpoint selection on validation (beam search)")
@@ -3021,17 +3954,25 @@ def run(cfg: Config) -> int:
     if cache:
         LOGGER.info("found cached validation decodes for %d checkpoint(s)", len(cache))
 
+    # The repair pass gets its own cache and its own signature. A base decode does not depend
+    # on the ladder or the detector thresholds - the repair is a second pass over a handful of
+    # utterances - so changing either must invalidate the repairs and nothing else.
+    repair_signature = {**decode_signature, "repair": repair_spec}
+    repair_cache_path = cfg.output_dir / "repair_cache.json"
+    repair_cache = _load_decode_cache(repair_cache_path, repair_signature)
+
     reranking: List[Dict[str, Any]] = []
     best_score: Optional[float] = None
     best_entry: Optional[Dict[str, Any]] = None
     best_report: Optional[WerReport] = None
     best_hyps: Optional[List[str]] = None
+    best_flagged: List[Tuple[int, DegeneracyVerdict]] = []
 
     for candidate in candidates:
         weights_fingerprint = _checkpoint_fingerprint(candidate)
         scored_model: Optional[WhisperForConditionalGeneration] = None
 
-        def decode(on_progress, resume_from, _candidate=candidate):
+        def decode(on_progress, resume_from, resume_truncated, _candidate=candidate):
             nonlocal scored_model
             if scored_model is None:
                 scored_model = load_model(
@@ -3050,9 +3991,10 @@ def run(cfg: Config) -> int:
                 description=f"valid/{_candidate.name}",
                 on_progress=on_progress,
                 resume_from=resume_from,
+                resume_truncated=resume_truncated,
             )
 
-        hypotheses = _decode_with_cache(
+        hypotheses, truncated = _decode_with_cache(
             cache, cache_path, decode_signature, candidate.name, weights_fingerprint,
             valid_dataset, decode,
         )
@@ -3061,21 +4003,29 @@ def run(cfg: Config) -> int:
             _free_cuda()
 
         report = compute_wer_report(valid_dataset.texts(), hypotheses, cfg.expand_numbers)
+        # Counted for every candidate but repaired for none of them: repairing all of them
+        # would multiply this stage's cost by the candidate count and could change the winner,
+        # which would then invalidate the test decode cache. Selection therefore runs on the
+        # pre-repair metric, and only the winner's decode is repaired, below. The count still
+        # earns its place - it says whether the failure mode is checkpoint-specific.
+        flagged = flag_degenerate(valid_dataset, hypotheses, truncated, word_rate_limit, cfg)
         entry = {
             "checkpoint": str(candidate),
             "valid_wer_norm": report.wer_norm,
             "valid_wer_raw": report.wer_raw,
             "valid_cer_norm": report.cer_norm,
+            "num_degenerate": len(flagged),
         }
         reranking.append(entry)
         LOGGER.info(
-            "  %-28s wer_norm=%.4f  wer_raw=%.4f  cer_norm=%.4f",
-            candidate.name, report.wer_norm, report.wer_raw, report.cer_norm,
+            "  %-28s wer_norm=%.4f  wer_raw=%.4f  cer_norm=%.4f  degenerate=%d",
+            candidate.name, report.wer_norm, report.wer_raw, report.cer_norm, len(flagged),
         )
         # An unscorable checkpoint sorts last rather than winning by accident.
         score = float("inf") if math.isnan(report.wer_norm) else report.wer_norm
         if best_score is None or score < best_score:
             best_score, best_entry, best_report, best_hyps = score, entry, report, hypotheses
+            best_flagged = flagged
 
     if best_entry is None or best_report is None or best_hyps is None:
         raise RuntimeError("checkpoint re-ranking produced no result")
@@ -3101,23 +4051,10 @@ def run(cfg: Config) -> int:
         ],
         chart=("checkpoint", "valid_wer_norm", f"Validation WER, beam={cfg.final_num_beams}"),
     )
-    TRACKER.summary({
-        "valid/wer_norm": best_report.wer_norm,
-        "valid/wer_raw": best_report.wer_raw,
-        "valid/cer_norm": best_report.cer_norm,
-        "valid/num_beams": cfg.final_num_beams,
-        # The greedy score the Trainer selected on, beside the beam score that
-        # actually decided. Seeing the two together is what tells you whether beam
-        # search reordered the candidates.
-        "valid/best_greedy_wer_norm_during_training": best_greedy_wer,
-        "select/checkpoint": Path(best_entry["checkpoint"]).name,
-        "select/num_candidates": len(reranking),
-    })
-    write_predictions_csv(
-        cfg.output_dir / "valid_predictions.csv", valid_dataset, best_hyps, best_report
-    )
-    log_predictions_table("select/valid_samples", valid_dataset, best_hyps, best_report, cfg)
 
+    # Loaded before the validation CSV is written, because the repair pass below decodes with
+    # it. generation_config.use_cache is already True, so this assignment - which exists to make
+    # the saved artefact an inference model - changes nothing about what generate() produces.
     best_model = load_model(
         cfg, model_path, source=best_entry["checkpoint"], tokenizer=tokenizer
     )
@@ -3127,6 +4064,47 @@ def run(cfg: Config) -> int:
     processor.save_pretrained(str(cfg.best_model_dir))
     LOGGER.info("saved the selected model to %s", cfg.best_model_dir)
 
+    selected_fingerprint = _checkpoint_fingerprint(Path(best_entry["checkpoint"]))
+    valid_before_repair = best_report
+    valid_hyps, valid_repairs = _run_repair(
+        model=best_model, dataset=valid_dataset, hypotheses=best_hyps, flagged=best_flagged,
+        report=best_report, collator=collator, tokenizer=tokenizer, cfg=cfg,
+        max_length=final_max_length, token_rate_cap=token_rate_cap,
+        word_rate_limit=word_rate_limit, use_bf16=use_bf16, description="valid",
+        cache=repair_cache, cache_path=repair_cache_path, signature=repair_signature,
+        cache_key="valid:selected", weights_fingerprint=selected_fingerprint,
+    )
+    if valid_repairs:
+        best_report = compute_wer_report(valid_dataset.texts(), valid_hyps, cfg.expand_numbers)
+        LOGGER.info(
+            "  valid wer_norm %.4f -> %.4f after repair",
+            valid_before_repair.wer_norm, best_report.wer_norm,
+        )
+    write_predictions_csv(
+        cfg.output_dir / "valid_predictions.csv", valid_dataset, valid_hyps, best_report,
+        {outcome.index: outcome for outcome in valid_repairs},
+    )
+    # Below the repair pass on purpose: it recomputes best_report, and a dashboard
+    # that disagreed with final_results.json about the selected model's WER would be
+    # worse than no dashboard. before_repair is logged beside it so the pass's effect
+    # is visible rather than silently folded into the headline number.
+    TRACKER.summary({
+        "valid/wer_norm": best_report.wer_norm,
+        "valid/wer_raw": best_report.wer_raw,
+        "valid/cer_norm": best_report.cer_norm,
+        "valid/wer_norm_before_repair": valid_before_repair.wer_norm,
+        "valid/num_repaired": len(valid_repairs),
+        "valid/num_flagged_degenerate": len(best_flagged),
+        "valid/num_beams": cfg.final_num_beams,
+        # The greedy score the Trainer selected on, beside the beam score that
+        # actually decided. Seeing the two together is what tells you whether beam
+        # search reordered the candidates.
+        "valid/best_greedy_wer_norm_during_training": best_greedy_wer,
+        "select/checkpoint": Path(best_entry["checkpoint"]).name,
+        "select/num_candidates": len(reranking),
+    })
+    log_predictions_table("select/valid_samples", valid_dataset, valid_hyps, best_report, cfg)
+
     # ---- stage 5: the single test pass -----------------------------------
     banner("Stage 5/5 - final test decoding")
     # The test split is decoded once per selected model. If the run is interrupted
@@ -3135,9 +4113,8 @@ def run(cfg: Config) -> int:
     # weights, a different selection always forces a fresh decode.
     test_cache_path = cfg.output_dir / "test_decode_cache.json"
     test_cache = _load_decode_cache(test_cache_path, decode_signature)
-    selected_fingerprint = _checkpoint_fingerprint(Path(best_entry["checkpoint"]))
 
-    def decode_test(on_progress, resume_from):
+    def decode_test(on_progress, resume_from, resume_truncated):
         return transcribe_dataset(
             model=best_model,
             dataset=test_dataset,
@@ -3151,16 +4128,36 @@ def run(cfg: Config) -> int:
             description="test",
             on_progress=on_progress,
             resume_from=resume_from,
+            resume_truncated=resume_truncated,
         )
 
-    test_hyps = _decode_with_cache(
+    test_hyps, test_truncated = _decode_with_cache(
         test_cache, test_cache_path, decode_signature, "selected", selected_fingerprint,
         test_dataset, decode_test,
     )
 
-    test_report = compute_wer_report(test_dataset.texts(), test_hyps, cfg.expand_numbers)
+    test_before_repair = compute_wer_report(
+        test_dataset.texts(), test_hyps, cfg.expand_numbers
+    )
+    test_report = test_before_repair
+    test_flagged = flag_degenerate(test_dataset, test_hyps, test_truncated, word_rate_limit, cfg)
+    test_hyps, test_repairs = _run_repair(
+        model=best_model, dataset=test_dataset, hypotheses=test_hyps, flagged=test_flagged,
+        report=test_before_repair, collator=collator, tokenizer=tokenizer, cfg=cfg,
+        max_length=final_max_length, token_rate_cap=token_rate_cap,
+        word_rate_limit=word_rate_limit, use_bf16=use_bf16, description="test",
+        cache=repair_cache, cache_path=repair_cache_path, signature=repair_signature,
+        cache_key="test:selected", weights_fingerprint=selected_fingerprint,
+    )
+    if test_repairs:
+        test_report = compute_wer_report(test_dataset.texts(), test_hyps, cfg.expand_numbers)
+        LOGGER.info(
+            "  test wer_norm %.4f -> %.4f after repair",
+            test_before_repair.wer_norm, test_report.wer_norm,
+        )
     write_predictions_csv(
-        cfg.output_dir / "test_predictions.csv", test_dataset, test_hyps, test_report
+        cfg.output_dir / "test_predictions.csv", test_dataset, test_hyps, test_report,
+        {outcome.index: outcome for outcome in test_repairs},
     )
     log_predictions_table("test/samples", test_dataset, test_hyps, test_report, cfg)
 
@@ -3175,22 +4172,43 @@ def run(cfg: Config) -> int:
             "wer_normalized": best_report.wer_norm,
             "wer_raw": best_report.wer_raw,
             "cer_normalized": best_report.cer_norm,
+            "wer_normalized_before_repair": valid_before_repair.wer_norm,
             "num_utterances": best_report.num_pairs,
             "num_skipped_empty_references": best_report.num_skipped_empty_refs,
             "num_beams": cfg.final_num_beams,
             "best_greedy_wer_normalized_during_training": best_greedy_wer,
+            "degenerate_repair": _repair_summary(valid_before_repair, best_flagged, valid_repairs),
         },
         "test": {
             "wer_normalized": test_report.wer_norm,
             "wer_raw": test_report.wer_raw,
             "cer_normalized": test_report.cer_norm,
+            "wer_normalized_before_repair": test_before_repair.wer_norm,
             "num_utterances": test_report.num_pairs,
             "num_skipped_empty_references": test_report.num_skipped_empty_refs,
             "num_beams": cfg.final_num_beams,
             "wer_by_region": grouped_wer(test_dataset.records, test_report, "region"),
             "wer_by_province": grouped_wer(test_dataset.records, test_report, "province_name"),
+            "degenerate_repair": _repair_summary(test_before_repair, test_flagged, test_repairs),
         },
+        "excluded_utterances": {
+            "count": len(excluded_utterances),
+            "env_var": "VIMD_EXCLUDE_UTTERANCES",
+            "note": (
+                "removed from their split before decoding and scoring, so every figure in this "
+                "file is computed without them and num_utterances counts what remained"
+            ),
+            "rows": excluded_utterances,
+        },
+        "degenerate_repair_spec": repair_spec,
         "checkpoint_reranking": reranking,
+        "checkpoint_reranking_note": (
+            "valid_wer_norm here is the PRE-repair score for every candidate, including the "
+            "winner, so that adding the repair pass can neither change which checkpoint wins "
+            "nor invalidate the test decode cache. validation.wer_normalized above is the "
+            "winner's score after its degenerate hypotheses were repaired; "
+            "validation.wer_normalized_before_repair is the figure comparable with this table."
+        ),
         "splits": summaries,
         "training": {
             "num_train_utterances_used": len(train_dataset),
@@ -3230,6 +4248,10 @@ def run(cfg: Config) -> int:
         "test/num_utterances": test_report.num_pairs,
         "test/num_skipped_empty_references": test_report.num_skipped_empty_refs,
         "test/num_beams": cfg.final_num_beams,
+        "test/wer_norm_before_repair": test_before_repair.wer_norm,
+        "test/num_repaired": len(test_repairs),
+        "test/num_flagged_degenerate": len(test_flagged),
+        "test/num_excluded_utterances": len(excluded_utterances),
         "status": "complete",
     })
     for key, title in (("region", "Test WER by region"), ("province", "Test WER by province")):
