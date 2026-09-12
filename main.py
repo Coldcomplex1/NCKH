@@ -903,6 +903,18 @@ class WandbRun:
 
         self._guard("table", apply)
 
+    def media(self, name: str, items: Sequence[Any]) -> None:
+        """Log media objects under one key.
+
+        Separate from log() because that passes its payload through _json_safe;
+        media must reach wandb as the objects themselves. Media also cannot travel
+        inside a wandb.Table: a wandb.Audio placed in a table cell serialises as the
+        bare string "Audio" and no audio file is written, silently."""
+        def apply() -> None:
+            self.run.log({name: list(items)})
+
+        self._guard("media", apply)
+
     def audio(self, pcm: np.ndarray, rate: int, caption: str) -> Any:
         """A wandb.Audio cell, or None when tracking is off or soundfile is missing."""
         if not self.enabled:
@@ -3083,14 +3095,11 @@ def log_predictions_table(
         "index", "region", "province", "gender", "duration",
         "reference", "prediction", "wer_norm",
     ]
-    with_audio = cfg.wandb_log_audio > 0
-    if with_audio:
-        columns.append("audio")
-
     rows: List[List[Any]] = []
+    clips: List[Any] = []
     for rank, index in enumerate(sample):
         record = dataset.records[index]
-        row: List[Any] = [
+        rows.append([
             index,
             record.get("region", ""),
             record.get("province_name", ""),
@@ -3099,17 +3108,24 @@ def log_predictions_table(
             record.get("text", ""),
             hypotheses[index],
             round(float(report.per_utterance_wer[index]), 4),
-        ]
-        if with_audio:
-            # Audio is the expensive column - one clip is ~100 kB of wav - so only
-            # the first VIMD_WANDB_LOG_AUDIO rows, which are the worst ones, carry it.
-            row.append(
-                TRACKER.audio(dataset[index]["audio"], cfg.sampling_rate, record.get("text", ""))
-                if rank < cfg.wandb_log_audio
-                else None
+        ])
+        # Audio is the expensive part - one clip is ~100 kB of wav - so only the
+        # first VIMD_WANDB_LOG_AUDIO rows, which are the worst ones, carry it. It is
+        # logged beside the table rather than in it: a wandb.Audio in a table cell
+        # serialises as the string "Audio" and no file is written, with no error.
+        # The caption is what ties a clip back to its row.
+        if rank < cfg.wandb_log_audio:
+            clip = TRACKER.audio(
+                dataset[index]["audio"],
+                cfg.sampling_rate,
+                f"#{index} {record.get('province_name', '')} | "
+                f"ref: {record.get('text', '')} | hyp: {hypotheses[index]}",
             )
-        rows.append(row)
+            if clip is not None:
+                clips.append(clip)
     TRACKER.table(name, columns, rows)
+    if clips:
+        TRACKER.media(f"{name}_audio", clips)
 
 
 def split_summary(dataset: ViMDDataset, cfg: Config) -> Dict[str, Any]:
