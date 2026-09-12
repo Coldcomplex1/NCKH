@@ -473,6 +473,7 @@ accordingly: each trial retains up to `VIMD_SAVE_TOTAL_LIMIT` checkpoints at ~19
 main.py            the entire pipeline, self-contained
 requirements.txt   pinned dependencies
 README.MD          this file
+.gitignore         the runtime directories below, which must never be committed
 data/              created at runtime: the 16 kHz cache
 outputs/           created at runtime: models, metrics, predictions, logs
 ```

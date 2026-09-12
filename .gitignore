@@ -1,0 +1,24 @@
+# Everything here is created at runtime by main.py (see README §11). None of it
+# belongs in the repository: the audio cache alone is ~12 GB and a single
+# retained checkpoint is ~19 GB.
+
+# The 16 kHz audio cache and the transient raw parquet shards.
+data/
+
+# Models, checkpoints, metrics, predictions, decode caches, logs and the
+# directory lock. outputs*/ also covers the separate directories a smoke test or
+# a hyperparameter sweep needs, since reusing one output directory across
+# configurations is refused by the recipe guard.
+outputs*/
+
+# HF_HOME defaults to <repo>/.hf_cache so a small $HOME quota cannot break the
+# 6.2 GB model download.
+.hf_cache/
+
+# W&B keeps its run files under VIMD_OUTPUT_DIR, but the wandb CLI writes ./wandb
+# in whatever directory it is invoked from.
+wandb/
+
+# Python bytecode.
+__pycache__/
+*.py[cod]
