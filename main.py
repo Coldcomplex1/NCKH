@@ -864,9 +864,6 @@ class WandbRun:
             )
             self.enabled = False
 
-    def log(self, payload: Dict[str, Any]) -> None:
-        self._guard("log", lambda: self.run.log(_json_safe(payload)))
-
     def summary(self, payload: Dict[str, Any]) -> None:
         def apply() -> None:
             for key, value in _json_safe(payload).items():
@@ -906,8 +903,8 @@ class WandbRun:
     def media(self, name: str, items: Sequence[Any]) -> None:
         """Log media objects under one key.
 
-        Separate from log() because that passes its payload through _json_safe;
-        media must reach wandb as the objects themselves. Media also cannot travel
+        Media cannot be passed through _json_safe, which every other writer here
+        applies, and it is deliberately not batched with them. Media also cannot travel
         inside a wandb.Table: a wandb.Audio placed in a table cell serialises as the
         bare string "Audio" and no audio file is written, silently."""
         def apply() -> None:

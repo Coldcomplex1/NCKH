@@ -571,6 +571,30 @@ wandb login                              # once per machine; the key lands in ~/
 bash run.sh
 ```
 
+### Checking the setup before a real run
+
+`selfcheck.py` verifies the machine, the install and the W&B wiring in about a minute, and
+**downloads nothing** — no model, no dataset, no Hub access. It builds a ~10k-parameter Whisper
+from a config, writes a few synthetic shards in the cache format of §3, and drives the real
+functions from `main.py` over them on the real GPU:
+
+```bash
+python3 selfcheck.py
+```
+
+It checks, and names the fix for whichever fails: the GPU is visible and runs a kernel; the pinned
+dependencies import; W&B credentials resolve without a prompt; a run opens; `ViMDDataset` reads the
+shard format; `Seq2SeqTrainer` trains **on the GPU** and logs into that same run rather than opening
+a second; the tables, dialect charts, prediction samples and audio clips are all written; result
+files upload as an artifact; and a restart reattaches to the same run instead of starting another.
+
+Exit status is 0 only when every check passes. It writes to `outputs_selfcheck/` and removes it
+afterwards (`VIMD_SELFCHECK_KEEP=1` keeps it), so it never touches `data/`, `outputs/` or any
+checkpoint, and is safe to run while a real job is in progress.
+
+It is not a substitute for the smoke test below: nothing here exercises the Hub download, the
+PhoWhisper tokenizer, shard conversion, beam search or the repair pass.
+
 ### Handing the code to someone else to run
 
 When the machine that runs this is not the machine that owns the W&B account, put the key in
@@ -667,6 +691,7 @@ accordingly: each trial retains up to `VIMD_SAVE_TOTAL_LIMIT` checkpoints at ~19
 ```
 run.sh             entry point: install, then train
 main.py            the entire pipeline, self-contained
+selfcheck.py       one-minute GPU + W&B verification; downloads nothing
 requirements.txt   pinned dependencies
 README.MD          this file
 .gitignore         the runtime directories below, which must never be committed
