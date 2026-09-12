@@ -575,6 +575,20 @@ TRAINING_RECIPE_KEYS: Tuple[str, ...] = (
 )
 
 
+def dataset_fingerprint_without_test(fingerprint: Dict[str, Any]) -> Dict[str, Any]:
+    """A dataset fingerprint with the test split's entries dropped.
+
+    Nothing reads the test split before stage 5, so a difference confined to it cannot have
+    changed a weight - which makes this the test for "did the data that trained this model
+    change, or only the data it is being scored on?"."""
+    out = dict(fingerprint)
+    for section in ("utterances", "text_digest"):
+        values = out.get(section)
+        if isinstance(values, dict):
+            out[section] = {k: v for k, v in values.items() if k != "test"}
+    return out
+
+
 def training_recipe_view(recipe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Project a recipe onto the part that determines the weights.
 
@@ -592,14 +606,8 @@ def training_recipe_view(recipe: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not isinstance(recipe, dict) or any(key not in recipe for key in TRAINING_RECIPE_KEYS):
         return None
     view = {key: recipe[key] for key in TRAINING_RECIPE_KEYS}
-    dataset = view.get("dataset")
-    if isinstance(dataset, dict):
-        dataset = dict(dataset)
-        for section in ("utterances", "text_digest"):
-            values = dataset.get(section)
-            if isinstance(values, dict):
-                dataset[section] = {k: v for k, v in values.items() if k != "test"}
-        view["dataset"] = dataset
+    if isinstance(view.get("dataset"), dict):
+        view["dataset"] = dataset_fingerprint_without_test(view["dataset"])
     return view
 
 
@@ -2411,7 +2419,7 @@ def repair_degenerate(
         {
             "weights": weights_fingerprint,
             "flagged": [
-                [str(dataset.records[index].get("filename", index)), hypotheses[index]]
+                [index, str(dataset.records[index].get("filename", index)), hypotheses[index]]
                 for index, _ in flagged
             ],
         }
@@ -2427,10 +2435,14 @@ def repair_degenerate(
     for index, verdict in flagged:
         record = dataset.records[index]
         filename = str(record.get("filename") or f"index-{index}")
+        # Keyed by position as well as name. Nothing in ViMD guarantees filenames are unique
+        # across shards, and two flagged rows sharing one would otherwise have the first row's
+        # repair served to the second - silently, and as a wrong hypothesis in the score.
+        cache_entry_key = f"{index}:{filename}"
         duration = float(record.get("duration", 0.0))
         LOGGER.warning("  %s %s %.1fs %s", description, filename, duration, verdict.summary())
 
-        cached = stored.get(filename)
+        cached = stored.get(cache_entry_key)
         if isinstance(cached, dict) and isinstance(cached.get("after"), str):
             after = cached["after"]
             rung = int(cached.get("rung", -1))
@@ -2473,7 +2485,7 @@ def repair_degenerate(
                         overrides["max_length"] = attempt_max_length
                     break
 
-            stored[filename] = {
+            stored[cache_entry_key] = {
                 "after": after,
                 "rung": rung,
                 "overrides": overrides,
@@ -3238,20 +3250,29 @@ def run(cfg: Config) -> int:
     }
     previous = _read_json(fingerprint_path)
     if isinstance(previous, dict) and previous != fingerprint:
-        LOGGER.warning(
-            "the dataset changed since the last run in this output directory:\n  before: %s\n"
-            "  now:    %s\nExisting checkpoints were trained on different data or a different "
-            "number of steps per epoch. For a clean run, delete %s.",
-            json.dumps(previous, ensure_ascii=False),
-            json.dumps(fingerprint, ensure_ascii=False),
-            cfg.checkpoint_dir,
-        )
+        if dataset_fingerprint_without_test(previous) == dataset_fingerprint_without_test(
+            fingerprint
+        ):
+            # What excluding a test utterance looks like. Telling someone to delete their
+            # checkpoints over it would be wrong, and they would probably do it.
+            LOGGER.info(
+                "the test split differs from the last run in this output directory (%s -> %s "
+                "utterances); nothing that trained the model changed, so the checkpoints stay "
+                "valid and only the test decode is redone",
+                (previous.get("utterances") or {}).get("test"),
+                fingerprint["utterances"].get("test"),
+            )
+        else:
+            LOGGER.warning(
+                "the dataset changed since the last run in this output directory:\n  before: %s\n"
+                "  now:    %s\nExisting checkpoints were trained on different data or a different "
+                "number of steps per epoch. For a clean run, delete %s.",
+                json.dumps(previous, ensure_ascii=False),
+                json.dumps(fingerprint, ensure_ascii=False),
+                cfg.checkpoint_dir,
+            )
     _write_json_atomic(fingerprint_path, fingerprint)
 
-    # The recipe is only fully known once the data is indexed, which is why the
-    # completion check lives here rather than at the top of the run: a finished run
-    # spends a couple of minutes re-verifying shards before exiting, and in exchange a
-    # changed configuration can never be answered with a previous experiment's result.
     # Two decode budgets and two degeneracy limits, all four derived from the TRAINING split
     # only: the periodic evaluations use a train-derived cap purely for speed, and deriving
     # every limit from train keeps validation and test out of the decisions made about them.
@@ -3283,6 +3304,10 @@ def run(cfg: Config) -> int:
             "token_rate_cap": round(token_rate_cap, 4),
         }
 
+    # The recipe is only fully known once the data is indexed, which is why the completion
+    # check below lives here rather than at the top of the run: a finished run spends a couple
+    # of minutes re-verifying shards before exiting, and in exchange a changed configuration
+    # can never be answered with a previous experiment's result.
     recipe = recipe_fingerprint(cfg, fingerprint, model_revision, repair_spec)
     _write_json_atomic(cfg.output_dir / "run_recipe.json", recipe)
 
