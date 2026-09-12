@@ -30,10 +30,23 @@ ROOT = Path(__file__).resolve().parent
 
 os.environ.setdefault("HF_HOME", str(ROOT / ".hf_cache"))
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-# Never let an experiment tracker try to authenticate: it would block on a prompt
-# and the lab runs this job unattended.
-os.environ.setdefault("WANDB_DISABLED", "true")
-os.environ.setdefault("WANDB_MODE", "offline")
+# Never let an experiment tracker try to authenticate unasked: it would block on a
+# prompt and the lab runs this job unattended. VIMD_WANDB=1 is the single switch
+# that opts in, and it has to be read here rather than from Config, because the
+# transformers integration checks WANDB_DISABLED at import time.
+_WANDB_ON = os.environ.get("VIMD_WANDB", "").strip().lower() in ("1", "true", "yes", "y", "on")
+if _WANDB_ON:
+    # transformers reads any of {"1","ON","YES","TRUE"} as "disabled", so an explicit
+    # falsey value is needed - simply leaving the variable unset is not enough when
+    # something else in the environment already set it.
+    os.environ["WANDB_DISABLED"] = "false"
+    os.environ.setdefault("WANDB_MODE", "online")
+    # The run banner and per-step upload chatter would bury the training log.
+    os.environ.setdefault("WANDB_SILENT", "true")
+    os.environ.setdefault("WANDB_ERROR_REPORTING", "false")
+else:
+    os.environ.setdefault("WANDB_DISABLED", "true")
+    os.environ.setdefault("WANDB_MODE", "offline")
 os.environ.setdefault("COMET_MODE", "DISABLED")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -53,7 +66,9 @@ import itertools
 import json
 import logging
 import math
+import netrc
 import platform
+import random
 import re
 import shutil
 import socket
@@ -61,6 +76,8 @@ import sys
 import time
 import traceback
 import unicodedata
+import urllib.parse
+import uuid
 import wave
 import zlib
 from dataclasses import asdict, dataclass, field
@@ -204,6 +221,21 @@ class Config:
     min_vram_gb: float = field(default_factory=lambda: _env_float("VIMD_MIN_VRAM_GB", 70.0))
     min_ram_gb: float = field(default_factory=lambda: _env_float("VIMD_MIN_RAM_GB", 24.0))
 
+    # --- experiment tracking ---------------------------------------------
+    # Deliberately absent from recipe_fingerprint(): watching a run cannot change
+    # the model it produces, and putting them there would invalidate every
+    # checkpoint directory that already exists.
+    wandb_enabled: bool = field(default_factory=lambda: _env_bool("VIMD_WANDB", False))
+    wandb_project: str = field(default_factory=lambda: _env_str("WANDB_PROJECT", "phowhisper-vimd"))
+    wandb_entity: str = field(default_factory=lambda: _env_str("WANDB_ENTITY", ""))
+    wandb_run_name: str = field(default_factory=lambda: _env_str("VIMD_WANDB_RUN_NAME", ""))
+    wandb_mode: str = field(default_factory=lambda: _env_str("WANDB_MODE", "online"))
+    wandb_tags: str = field(default_factory=lambda: _env_str("VIMD_WANDB_TAGS", ""))
+    wandb_notes: str = field(default_factory=lambda: _env_str("VIMD_WANDB_NOTES", ""))
+    wandb_log_samples: int = field(default_factory=lambda: _env_int("VIMD_WANDB_LOG_SAMPLES", 64))
+    wandb_log_audio: int = field(default_factory=lambda: _env_int("VIMD_WANDB_LOG_AUDIO", 0))
+    wandb_log_model: bool = field(default_factory=lambda: _env_bool("VIMD_WANDB_LOG_MODEL", False))
+
     # --- paths -----------------------------------------------------------
     data_dir: Path = field(default_factory=lambda: Path(_env_str("VIMD_DATA_DIR", str(ROOT / "data" / "vimd_16k"))))
     raw_dir: Path = field(default_factory=lambda: Path(_env_str("VIMD_RAW_DIR", str(ROOT / "data" / "_raw_parquet"))))
@@ -297,6 +329,14 @@ class Config:
                 )
         if self.min_free_gb > self.recommended_free_gb:
             raise ValueError("VIMD_MIN_FREE_GB cannot exceed VIMD_RECOMMENDED_FREE_GB")
+        if self.wandb_mode not in ("online", "offline", "disabled"):
+            raise ValueError(
+                f"WANDB_MODE must be online, offline or disabled, got {self.wandb_mode!r}"
+            )
+        for name in ("wandb_log_samples", "wandb_log_audio"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
 
 
 # The official ViMD split names are train / valid / test. There is no split
@@ -645,6 +685,264 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, float):
         return None if math.isnan(value) or math.isinf(value) else value
     return value
+
+
+# ===========================================================================
+# 2c. Experiment tracking (Weights & Biases)
+# ===========================================================================
+#
+# Three rules, in priority order:
+#   1. Off unless asked. VIMD_WANDB=1 is the only switch; without it not one wandb
+#      symbol is imported and the run behaves exactly as it did before.
+#   2. Never fatal. A dropped network at hour nine must cost the graphs, not the
+#      run, so every call is guarded and the tracker latches to no-op on the first
+#      failure rather than raising into an eleven-hour job.
+#   3. Resumable. The run id is persisted beside the checkpoints, so restarting
+#      after a crash continues one run instead of littering the project with a
+#      dozen partial ones.
+#
+# Credentials are never read from, or written to, this repository: wandb picks up
+# `wandb login` (~/.netrc) or WANDB_API_KEY from the environment. There is
+# deliberately no configuration field for an API key - this file is public.
+
+
+class WandbRun:
+    """Fail-safe wrapper around exactly one wandb run."""
+
+    def __init__(self) -> None:
+        self._wandb: Any = None
+        self.run: Any = None
+        self.enabled: bool = False
+        self.run_id: str = ""
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self, cfg: Config, environment: Dict[str, Any]) -> None:
+        if not cfg.wandb_enabled:
+            LOGGER.info("experiment tracking off (set VIMD_WANDB=1 to enable)")
+            return
+        try:
+            import wandb
+        except ImportError:
+            LOGGER.warning(
+                "VIMD_WANDB=1 but wandb is not installed (pip install wandb==0.22.3); "
+                "continuing without tracking"
+            )
+            return
+
+        # Keep every byte wandb writes inside the output directory, for the same
+        # reason HF_HOME lives inside the repo: a small $HOME quota must not be able
+        # to kill an eleven-hour job.
+        wandb_root = cfg.output_dir / "wandb"
+        for sub in ("cache", "artifacts", "config"):
+            (wandb_root / sub).mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("WANDB_DIR", str(cfg.output_dir))
+        os.environ.setdefault("WANDB_CACHE_DIR", str(wandb_root / "cache"))
+        os.environ.setdefault("WANDB_ARTIFACT_DIR", str(wandb_root / "artifacts"))
+        os.environ.setdefault("WANDB_CONFIG_DIR", str(wandb_root / "config"))
+        # transformers' WandbCallback reads these two directly. Pin them so a stray
+        # shell export cannot start uploading 19 GB checkpoints every 250 steps, or
+        # hook a gradient histogram onto 1.5 billion parameters.
+        os.environ["WANDB_LOG_MODEL"] = "false"
+        os.environ["WANDB_WATCH"] = "false"
+        os.environ.setdefault("WANDB_PROJECT", cfg.wandb_project)
+
+        mode = cfg.wandb_mode
+        if mode == "online" and not self._has_credentials():
+            # wandb asks for a missing key through getpass(), which returns False
+            # only when there is no tty. The lab runs this inside tmux, where there
+            # is one, so an unconfigured host would sit on that prompt for the whole
+            # night - precisely the failure this file's WANDB_DISABLED default was
+            # written to prevent. Record locally instead and let it be synced later.
+            LOGGER.warning(
+                "VIMD_WANDB=1 but no wandb credentials were found (no WANDB_API_KEY, "
+                "no netrc entry for %s). Recording offline so the run cannot block on "
+                "a login prompt. To upload afterwards:\n"
+                "    wandb sync %s",
+                self._api_host(), wandb_root / "offline-run-*",
+            )
+            LOGGER.warning(
+                "To log live instead, run `wandb login` once on this machine (or export "
+                "WANDB_API_KEY) and re-launch; the run resumes into the same record."
+            )
+            mode = "offline"
+        os.environ["WANDB_MODE"] = mode
+
+        self.run_id = self._resolve_run_id(cfg)
+        config = {**cfg.to_dict(), **{f"env/{k}": v for k, v in environment.items()}}
+        try:
+            self.run = wandb.init(
+                project=cfg.wandb_project,
+                entity=cfg.wandb_entity or None,
+                id=self.run_id,
+                resume="allow",  # the same id after a crash means one continuous run
+                mode=mode,
+                dir=str(cfg.output_dir),
+                name=cfg.wandb_run_name or f"{cfg.output_dir.name}-{self.run_id}",
+                notes=cfg.wandb_notes or None,
+                tags=[tag.strip() for tag in cfg.wandb_tags.split(",") if tag.strip()],
+                config=_json_safe(config),
+                # login_timeout is the second line of defence behind the credential
+                # check above: even a prompt reached by some path this misses gives up
+                # rather than holding the GPU idle until someone notices.
+                settings=wandb.Settings(init_timeout=120, login_timeout=30),
+            )
+        except BaseException as exc:  # noqa: BLE001 - tracking must never end a run
+            LOGGER.warning("wandb.init failed (%s); continuing without tracking", exc)
+            self.run = None
+            return
+        self._wandb = wandb
+        self.enabled = True
+        LOGGER.info(
+            "wandb run %s (%s) -> %s",
+            self.run_id,
+            mode,
+            getattr(self.run, "url", None) or "offline, sync later with `wandb sync`",
+        )
+
+    @staticmethod
+    def _api_host() -> str:
+        base = os.environ.get("WANDB_BASE_URL", "") or "https://api.wandb.ai"
+        return urllib.parse.urlparse(base).netloc or "api.wandb.ai"
+
+    @classmethod
+    def _has_credentials(cls) -> bool:
+        """True when wandb can authenticate without asking a human.
+
+        Mirrors wandb's own lookup order - WANDB_API_KEY, then the netrc entry for
+        the API host - so that "no credentials" here means the same thing it means
+        one function call later, inside wandb.init()."""
+        if os.environ.get("WANDB_API_KEY", "").strip():
+            return True
+        override = os.environ.get("NETRC", "").strip()
+        candidates = (
+            [Path(override).expanduser()]
+            if override
+            else [Path.home() / ".netrc", Path.home() / "_netrc"]
+        )
+        host = cls._api_host()
+        for candidate in candidates:
+            try:
+                if not candidate.is_file():
+                    continue
+                authenticators = netrc.netrc(str(candidate)).authenticators(host)
+            except BaseException:  # noqa: BLE001 - an unreadable netrc is "no key"
+                continue
+            if authenticators and authenticators[2]:
+                return True
+        return False
+
+    @staticmethod
+    def _resolve_run_id(cfg: Config) -> str:
+        """One output directory is one wandb run, across any number of restarts."""
+        marker = cfg.output_dir / "wandb_run.json"
+        stored = _read_json(marker)
+        if isinstance(stored, dict) and isinstance(stored.get("id"), str) and stored["id"]:
+            return stored["id"]
+        run_id = uuid.uuid4().hex[:8]
+        _write_json_atomic(marker, {"id": run_id, "project": cfg.wandb_project})
+        return run_id
+
+    def finish(self, exit_code: int = 0) -> None:
+        if self.run is None:
+            return
+        try:
+            self.run.finish(exit_code=exit_code)
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning("wandb.finish failed: %s", exc)
+        finally:
+            self.run, self.enabled = None, False
+
+    # -- guarded writers --------------------------------------------------
+    def _guard(self, action: str, operation) -> None:
+        if not self.enabled:
+            return
+        try:
+            operation()
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "wandb %s failed (%s); tracking is off for the rest of this run", action, exc
+            )
+            self.enabled = False
+
+    def log(self, payload: Dict[str, Any]) -> None:
+        self._guard("log", lambda: self.run.log(_json_safe(payload)))
+
+    def summary(self, payload: Dict[str, Any]) -> None:
+        def apply() -> None:
+            for key, value in _json_safe(payload).items():
+                self.run.summary[key] = value
+
+        self._guard("summary", apply)
+
+    def config_update(self, payload: Dict[str, Any]) -> None:
+        self._guard(
+            "config",
+            lambda: self.run.config.update(_json_safe(payload), allow_val_change=True),
+        )
+
+    def table(
+        self,
+        name: str,
+        columns: Sequence[str],
+        rows: Sequence[Sequence[Any]],
+        chart: Optional[Tuple[str, str, str]] = None,
+    ) -> None:
+        """Log a table, optionally with a bar chart over two of its columns.
+
+        Tables rather than stepped scalars, because the transformers callback calls
+        define_metric("*", step_metric="train/global_step"): anything logged after
+        training would otherwise be pinned to a step counter that stopped moving."""
+
+        def apply() -> None:
+            table = self._wandb.Table(columns=list(columns), data=[list(r) for r in rows])
+            payload: Dict[str, Any] = {name: table}
+            if chart is not None:
+                label, value, title = chart
+                payload[f"{name}_chart"] = self._wandb.plot.bar(table, label, value, title=title)
+            self.run.log(payload)
+
+        self._guard("table", apply)
+
+    def audio(self, pcm: np.ndarray, rate: int, caption: str) -> Any:
+        """A wandb.Audio cell, or None when tracking is off or soundfile is missing."""
+        if not self.enabled:
+            return None
+        try:
+            return self._wandb.Audio(pcm, sample_rate=rate, caption=caption[:120])
+        except BaseException as exc:  # noqa: BLE001
+            LOGGER.warning("wandb.Audio failed (%s); logging the table without audio", exc)
+            return None
+
+    def artifact(
+        self,
+        name: str,
+        kind: str,
+        paths: Sequence[Path],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        def apply() -> None:
+            artifact = self._wandb.Artifact(
+                name=name, type=kind, metadata=_json_safe(metadata or {})
+            )
+            added = 0
+            for path in paths:
+                if not path.exists():
+                    continue
+                if path.is_dir():
+                    artifact.add_dir(str(path))
+                else:
+                    artifact.add_file(str(path))
+                added += 1
+            if added:
+                self.run.log_artifact(artifact)
+
+        self._guard("artifact", apply)
+
+
+# One run per process, mirroring LOGGER. main() reaches it from its exception
+# handler, which is why it is module level rather than threaded through every
+# call site.
+TRACKER = WandbRun()
 
 
 # ===========================================================================
@@ -1914,7 +2212,12 @@ def build_seq2seq_trainer(
         dataloader_prefetch_factor=2 if cfg.dataloader_workers > 0 else None,
         remove_unused_columns=False,
         label_names=["labels"],
-        report_to=[],  # the default "all" would start wandb and block on a login prompt
+        # Attaches to the run TRACKER already opened: the HF callback only calls
+        # wandb.init() itself when wandb.run is None, so there is no second run and
+        # no login prompt. The empty list keeps the old behaviour when tracking is
+        # off - the default "all" would start wandb and block on a login prompt.
+        report_to=["wandb"] if TRACKER.enabled else [],
+        run_name=TRACKER.run_id or None,
         disable_tqdm=True,
         seed=cfg.seed,
         data_seed=cfg.seed,
@@ -2750,6 +3053,65 @@ def apply_exclusions(
     return filtered, removed
 
 
+def log_predictions_table(
+    name: str,
+    dataset: ViMDDataset,
+    hypotheses: Sequence[str],
+    report: WerReport,
+    cfg: Config,
+) -> None:
+    """Send a sample of decoded utterances to the tracker.
+
+    The worst half plus a random half, so the table shows both the failure modes
+    and what a typical utterance looks like - a table of only the worst cases reads
+    as if the model never works. Utterances with an empty reference carry no WER and
+    are skipped rather than sorted to one end."""
+    limit = cfg.wandb_log_samples
+    if not TRACKER.enabled or limit <= 0:
+        return
+    scored = [(i, w) for i, w in enumerate(report.per_utterance_wer) if w is not None]
+    if not scored:
+        return
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    worst = [index for index, _ in scored[: limit // 2]]
+    rest = [index for index, _ in scored[limit // 2 :]]
+    # Seeded so two runs over the same split sample the same utterances and the two
+    # tables can actually be read side by side.
+    sample = worst + random.Random(cfg.seed).sample(rest, min(limit - len(worst), len(rest)))
+
+    columns = [
+        "index", "region", "province", "gender", "duration",
+        "reference", "prediction", "wer_norm",
+    ]
+    with_audio = cfg.wandb_log_audio > 0
+    if with_audio:
+        columns.append("audio")
+
+    rows: List[List[Any]] = []
+    for rank, index in enumerate(sample):
+        record = dataset.records[index]
+        row: List[Any] = [
+            index,
+            record.get("region", ""),
+            record.get("province_name", ""),
+            record.get("gender", ""),
+            round(float(record.get("duration", 0.0)), 2),
+            record.get("text", ""),
+            hypotheses[index],
+            round(float(report.per_utterance_wer[index]), 4),
+        ]
+        if with_audio:
+            # Audio is the expensive column - one clip is ~100 kB of wav - so only
+            # the first VIMD_WANDB_LOG_AUDIO rows, which are the worst ones, carry it.
+            row.append(
+                TRACKER.audio(dataset[index]["audio"], cfg.sampling_rate, record.get("text", ""))
+                if rank < cfg.wandb_log_audio
+                else None
+            )
+        rows.append(row)
+    TRACKER.table(name, columns, rows)
+
+
 def split_summary(dataset: ViMDDataset, cfg: Config) -> Dict[str, Any]:
     durations = [float(record["duration"]) for record in dataset.records]
     return {
@@ -3155,6 +3517,7 @@ def _checkpoint_candidates(checkpoint_dir: Path, best: Optional[str]) -> List[Pa
 
 def run(cfg: Config) -> int:
     environment = preflight(cfg)
+    TRACKER.start(cfg, environment)
     use_bf16 = bool(environment["bf16_supported"])
     if not use_bf16:
         AutocastSeq2SeqTrainer.amp_dtype = torch.float16
@@ -3207,6 +3570,11 @@ def run(cfg: Config) -> int:
             too_long,
             cfg.max_label_tokens,
         )
+        TRACKER.summary({
+            f"data/{split}_label_tokens_max": max(lengths) if lengths else 0,
+            f"data/{split}_label_tokens_mean": (sum(lengths) / len(lengths)) if lengths else 0.0,
+            f"data/{split}_label_tokens_over_limit": too_long,
+        })
         if too_long and split != "train":
             LOGGER.warning(
                 "%d %s references exceed %d tokens; they are truncated in the teacher-forced "
@@ -3311,6 +3679,34 @@ def run(cfg: Config) -> int:
     recipe = recipe_fingerprint(cfg, fingerprint, model_revision, repair_spec)
     _write_json_atomic(cfg.output_dir / "run_recipe.json", recipe)
 
+    TRACKER.config_update({
+        "recipe": recipe,
+        "dataset_fingerprint": fingerprint,
+        "dataset_revision": dataset_revision,
+        "model_revision": model_revision,
+    })
+    TRACKER.summary({
+        "data/train_utterances_used": len(train_dataset),
+        "data/train_utterances_dropped": dropped,
+        **{f"data/{split}_utterances": s["num_utterances"] for split, s in summaries.items()},
+        **{f"data/{split}_hours": s["hours"] for split, s in summaries.items()},
+    })
+    TRACKER.table(
+        "data/splits",
+        ["split", "utterances", "hours", "speakers", "provinces", "over_30s"],
+        [
+            [
+                split,
+                s["num_utterances"],
+                s["hours"],
+                s["num_speakers"],
+                s["num_provinces"],
+                s["num_utterances_over_30s_truncated_by_whisper"],
+            ]
+            for split, s in summaries.items()
+        ],
+    )
+
     if cfg.results_path.exists():
         existing = _read_json(cfg.results_path)
         # Anything that is not a dict carrying a dict "test" is damage, not a result. A list, a
@@ -3325,6 +3721,8 @@ def run(cfg: Config) -> int:
                     "%s already holds a complete result for this exact recipe "
                     "(test wer_normalized=%.4f) - nothing to do", cfg.results_path, test_wer,
                 )
+                TRACKER.summary({"test/wer_norm": test_wer, "status": "already_complete"})
+                TRACKER.finish(0)
                 return 0
             # An evaluation-side difference is the common case for a re-score, and the way
             # out of it is not the same: the checkpoints in this directory are still valid,
@@ -3477,6 +3875,14 @@ def run(cfg: Config) -> int:
                     "retrying with batch %d x accum %d, eval batch %d",
                     train_batch_size, grad_accum, eval_batch_size,
                 )
+                # Without this, the discontinuity the back-off leaves in the loss
+                # curve has no explanation on the dashboard.
+                TRACKER.summary({
+                    "train/oom_backoffs": attempt + 1,
+                    "train/per_device_train_batch_size": train_batch_size,
+                    "train/gradient_accumulation_steps": grad_accum,
+                    "train/eval_batch_size": eval_batch_size,
+                })
 
         if trainer is None:
             raise RuntimeError("training did not run")
@@ -3631,6 +4037,20 @@ def run(cfg: Config) -> int:
         "selected %s with validation wer_norm=%.4f",
         best_entry["checkpoint"], best_entry["valid_wer_norm"],
     )
+    TRACKER.table(
+        "select/checkpoints",
+        ["checkpoint", "valid_wer_norm", "valid_wer_raw", "valid_cer_norm"],
+        [
+            [
+                Path(entry["checkpoint"]).name,
+                entry["valid_wer_norm"],
+                entry["valid_wer_raw"],
+                entry["valid_cer_norm"],
+            ]
+            for entry in reranking
+        ],
+        chart=("checkpoint", "valid_wer_norm", f"Validation WER, beam={cfg.final_num_beams}"),
+    )
 
     # Loaded before the validation CSV is written, because the repair pass below decodes with
     # it. generation_config.use_cache is already True, so this assignment - which exists to make
@@ -3664,6 +4084,26 @@ def run(cfg: Config) -> int:
         cfg.output_dir / "valid_predictions.csv", valid_dataset, valid_hyps, best_report,
         {outcome.index: outcome for outcome in valid_repairs},
     )
+    # Below the repair pass on purpose: it recomputes best_report, and a dashboard
+    # that disagreed with final_results.json about the selected model's WER would be
+    # worse than no dashboard. before_repair is logged beside it so the pass's effect
+    # is visible rather than silently folded into the headline number.
+    TRACKER.summary({
+        "valid/wer_norm": best_report.wer_norm,
+        "valid/wer_raw": best_report.wer_raw,
+        "valid/cer_norm": best_report.cer_norm,
+        "valid/wer_norm_before_repair": valid_before_repair.wer_norm,
+        "valid/num_repaired": len(valid_repairs),
+        "valid/num_flagged_degenerate": len(best_flagged),
+        "valid/num_beams": cfg.final_num_beams,
+        # The greedy score the Trainer selected on, beside the beam score that
+        # actually decided. Seeing the two together is what tells you whether beam
+        # search reordered the candidates.
+        "valid/best_greedy_wer_norm_during_training": best_greedy_wer,
+        "select/checkpoint": Path(best_entry["checkpoint"]).name,
+        "select/num_candidates": len(reranking),
+    })
+    log_predictions_table("select/valid_samples", valid_dataset, valid_hyps, best_report, cfg)
 
     # ---- stage 5: the single test pass -----------------------------------
     banner("Stage 5/5 - final test decoding")
@@ -3719,6 +4159,7 @@ def run(cfg: Config) -> int:
         cfg.output_dir / "test_predictions.csv", test_dataset, test_hyps, test_report,
         {outcome.index: outcome for outcome in test_repairs},
     )
+    log_predictions_table("test/samples", test_dataset, test_hyps, test_report, cfg)
 
     results = {
         "model": cfg.model_id,
@@ -3800,6 +4241,66 @@ def run(cfg: Config) -> int:
     _write_json_atomic(cfg.output_dir / "trainer_log_history.json", log_history)
     _write_json_atomic(cfg.results_path, results)
 
+    TRACKER.summary({
+        "test/wer_norm": test_report.wer_norm,
+        "test/wer_raw": test_report.wer_raw,
+        "test/cer_norm": test_report.cer_norm,
+        "test/num_utterances": test_report.num_pairs,
+        "test/num_skipped_empty_references": test_report.num_skipped_empty_refs,
+        "test/num_beams": cfg.final_num_beams,
+        "test/wer_norm_before_repair": test_before_repair.wer_norm,
+        "test/num_repaired": len(test_repairs),
+        "test/num_flagged_degenerate": len(test_flagged),
+        "test/num_excluded_utterances": len(excluded_utterances),
+        "status": "complete",
+    })
+    for key, title in (("region", "Test WER by region"), ("province", "Test WER by province")):
+        buckets = results["test"][f"wer_by_{key}"]
+        TRACKER.table(
+            f"test/wer_by_{key}",
+            [key, "wer_norm", "num_utterances"],
+            [
+                [name, stats["wer_norm"], stats["num_utterances"]]
+                for name, stats in sorted(buckets.items(), key=lambda kv: -kv[1]["wer_norm"])
+            ],
+            chart=(key, "wer_norm", title),
+        )
+    # The three regional figures also become sortable columns in the project's run
+    # table, so two runs can be compared on dialect coverage without opening either.
+    TRACKER.summary({
+        f"test/wer_norm_{_slugify(region)}": stats["wer_norm"]
+        for region, stats in results["test"]["wer_by_region"].items()
+    })
+    TRACKER.artifact(
+        f"results-{TRACKER.run_id or 'run'}",
+        "results",
+        [
+            cfg.results_path,
+            cfg.output_dir / "test_predictions.csv",
+            cfg.output_dir / "valid_predictions.csv",
+            cfg.output_dir / "metrics_history.json",
+            cfg.output_dir / "trainer_log_history.json",
+            cfg.output_dir / "run_recipe.json",
+        ],
+        metadata={
+            "test_wer_norm": test_report.wer_norm,
+            "valid_wer_norm": best_report.wer_norm,
+        },
+    )
+    if cfg.wandb_log_model:
+        # 6.2 GB, so opt-in only, and it needs upload staging space on top of the
+        # disk budget preflight checks. Uploads the selected model rather than every
+        # checkpoint, which is what WANDB_LOG_MODEL would have done.
+        TRACKER.artifact(
+            f"model-{TRACKER.run_id or 'run'}",
+            "model",
+            [cfg.best_model_dir],
+            metadata={
+                "test_wer_norm": test_report.wer_norm,
+                "checkpoint": best_entry["checkpoint"],
+            },
+        )
+
     banner("RESULTS")
     LOGGER.info(
         "validation  wer_normalized=%.4f  wer_raw=%.4f", best_report.wer_norm, best_report.wer_raw
@@ -3808,24 +4309,35 @@ def run(cfg: Config) -> int:
         "test        wer_normalized=%.4f  wer_raw=%.4f", test_report.wer_norm, test_report.wer_raw
     )
     LOGGER.info("results written to %s", cfg.results_path)
+    TRACKER.finish(0)
     return 0
 
 
 def main() -> int:
     cfg = Config()
     setup_logging(cfg.log_dir)
+    status = 1
     try:
         # Held for the whole run: checkpoints, caches and results are all written here.
         with DirectoryLock(cfg.output_dir, "training outputs").acquire():
-            return run(cfg)
+            status = run(cfg)
+            return status
     except KeyboardInterrupt:
         LOGGER.warning("interrupted; re-run the same command to resume")
-        return 130
+        status = 130
+        return status
     except BaseException:  # noqa: BLE001 - always leave a full trace in the log file
         # Logged once, then reported through the exit status. Re-raising here would print
         # the same traceback a second time as an uncaught exception.
         LOGGER.error("run failed:\n%s", traceback.format_exc())
-        return 1
+        status = 1
+        return status
+    finally:
+        # run() closes the tracker on the happy path; this catches every other exit so
+        # a crashed job is not left showing as "running" forever. Idempotent, and a
+        # no-op when the second-launch lock refused to let this process start - that
+        # process must not touch the live run's record.
+        TRACKER.finish(status)
 
 
 if __name__ == "__main__":

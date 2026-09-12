@@ -12,18 +12,29 @@ finish, needs no interaction, and resumes automatically if it is interrupted.
 ## 1. How to run
 
 ```bash
-pip install -r requirements.txt
+bash run.sh
 ```
 
+That is the whole procedure. `run.sh` installs the pinned dependencies and starts the run; the
+script downloads the model and the dataset itself, nothing has to be placed on disk beforehand,
+and no prompt is ever shown.
+
+Because the run outlives most SSH sessions, start it detached:
+
 ```bash
+tmux new -s vimd 'bash run.sh'      # detach with Ctrl-B then D
+```
+
+The two steps separately, if you prefer them explicit — identical except that experiment
+tracking is then off unless you ask for it (§10):
+
+```bash
+pip install -r requirements.txt
 python3 main.py
 ```
 
-That is the whole procedure. The script downloads the model and the dataset itself; nothing has to
-be placed on disk beforehand and no prompt is ever shown.
-
 Expected wall-clock on one 80 GB GPU: **~2–3 h** of one-time data preparation (network bound), then
-**~8–12 h** of training and evaluation. Re-running `python3 main.py` after a crash, a timeout or a
+**~8–12 h** of training and evaluation. Re-running `bash run.sh` after a crash, a timeout or a
 reboot resumes rather than starting over — see §8 for exactly how much work is repeated.
 
 Only one run may use an output directory at a time; a second launch aborts immediately with a clear
@@ -315,6 +326,10 @@ outputs/
 │                               checkpoints instead of resuming training into them
 ├── run_recipe.json             the recipe fingerprint this output directory belongs to
 ├── model_revision.json         the pinned PhoWhisper revision
+├── wandb_run.json              the W&B run id this directory owns, so a restart resumes
+│                               one run instead of starting a second (only with VIMD_WANDB=1)
+├── wandb/                      W&B run files, cache and artifacts, kept here rather than
+│                               under $HOME (only with VIMD_WANDB=1) — see §10
 ├── .vimd.lock                  PID/host lock; blocks a concurrent second launch
 ├── checkpoints/                HF Trainer checkpoints (used for resume)
 └── logs/train.log              complete run log
@@ -525,22 +540,111 @@ Every tunable is settable without editing code. Defaults in brackets.
 | `VIMD_MIN_VRAM_GB` / `VIMD_MIN_RAM_GB` | warn-only thresholds [`70`] / [`24`] |
 | `VIMD_DATA_DIR` / `VIMD_RAW_DIR` / `VIMD_OUTPUT_DIR` | paths, all default under the repo |
 | `VIMD_SEED` | [`42`] |
+| `VIMD_WANDB` | experiment tracking on/off [`0`] — the single switch, see §10 |
+| `WANDB_PROJECT` / `WANDB_ENTITY` | W&B project [`phowhisper-vimd`] / account [empty = default] |
+| `WANDB_MODE` | `online` / `offline` / `disabled` [`online` when tracking is on] |
+| `VIMD_WANDB_RUN_NAME` / `VIMD_WANDB_TAGS` / `VIMD_WANDB_NOTES` | run label, comma-separated tags, free-text note |
+| `VIMD_WANDB_LOG_SAMPLES` | decoded utterances in the predictions table [`64`], `0` disables |
+| `VIMD_WANDB_LOG_AUDIO` | audio clips attached to that table [`0`] |
+| `VIMD_WANDB_LOG_MODEL` | upload the selected model (6.2 GB) as an artifact [`0`] |
 | `HF_HOME` | Hub cache [`<repo>/.hf_cache`] — kept inside the repo so a small `$HOME` quota cannot break the 6.2 GB model download |
 
 Example — smaller GPU, same effective batch:
 
 ```bash
-VIMD_TRAIN_BATCH_SIZE=8 VIMD_GRAD_ACCUM=8 python3 main.py
+VIMD_TRAIN_BATCH_SIZE=8 VIMD_GRAD_ACCUM=8 bash run.sh
 ```
 
 ---
 
-## 10. Repository layout
+## 10. Experiment tracking (optional)
+
+Off by default. Without `VIMD_WANDB=1` nothing changes: no `wandb` import, no network
+call, no login prompt — which matters because this job runs unattended for hours and a
+tracker sitting on a prompt would waste a night.
+
+`bash run.sh` turns it on; a bare `python3 main.py` leaves it off. To log to wandb.ai live,
+authenticate once on the machine first:
+
+```bash
+wandb login                              # once per machine; the key lands in ~/.netrc
+bash run.sh
+```
+
+**Without credentials the run still records — it does not stop to ask.** `main.py` checks for a
+key the same way wandb does (`WANDB_API_KEY`, then the netrc entry for the API host) *before*
+calling `wandb.init`, and falls back to offline recording when it finds none, printing the
+`wandb sync` command to upload afterwards. This matters more than it sounds: wandb asks for a
+missing key through `getpass()`, which returns without asking only when there is no tty — and
+under tmux there is one, so an unconfigured host would otherwise hold the GPU at a password
+prompt all night.
+
+```bash
+VIMD_WANDB=0 bash run.sh                 # or skip tracking altogether
+```
+
+**Credentials never live in this repository.** There is no config field for an API key
+and none is ever read from a file in the tree. `wandb` picks up `wandb login` or, where
+`$HOME` is quota-bound, `WANDB_API_KEY` from the environment. This repository is public;
+a committed key would be scraped within minutes and cannot be un-published by deleting
+the commit.
+
+### What gets recorded
+
+| Stage | Recorded |
+|---|---|
+| 2 — indexing | full recipe and dataset fingerprint as run config; per-split utterances, hours, speakers, provinces; label-token statistics |
+| 3 — training | loss, learning rate, gradient norm, `eval_wer_norm` / `eval_wer_raw` / `eval_cer_norm` at every evaluation, plus GPU / VRAM / CPU / disk / network from wandb's own system monitor. Any OOM back-off records the batch sizes it fell back to, so the discontinuity it leaves in the loss curve has an explanation |
+| 4 — selection | one row per candidate checkpoint with its beam-search validation WER, and the greedy score the Trainer selected on beside the beam score that actually decided |
+| 5 — test | final WER/CER, WER broken down by region and by province, a sample of decoded utterances (worst half plus a seeded random half) optionally with audio, and `final_results.json` + both prediction CSVs as a versioned artifact |
+
+The Trainer covers stage 3 only; everything else is logged explicitly by `main.py`.
+
+### Resuming, and interruptions
+
+The run id is stored in `<output_dir>/wandb_run.json`, so one output directory is one
+W&B run no matter how many times the job is restarted — an interrupted run continues its
+own curves instead of starting a second run beside them. Every exit path, including a
+crash or `Ctrl-C`, closes the run with its exit status, so nothing is left showing as
+*running* after the process is gone.
+
+Everything wandb writes (run files, cache, artifacts, config) is kept under
+`VIMD_OUTPUT_DIR`, for the same reason `HF_HOME` is kept inside the repo: a small `$HOME`
+quota must not be able to kill an eleven-hour job.
+
+**Tracking never ends a run.** Every call into wandb is guarded; the first failure logs a
+warning and switches tracking off for the rest of the run. Losing the network at hour
+nine costs the graphs, not the training.
+
+### No network on the training host
+
+```bash
+WANDB_MODE=offline bash run.sh          # force offline even where a key exists
+wandb sync outputs/wandb/offline-run-*     # later, from a machine with network
+```
+
+Each restart in offline mode writes its *own* `offline-run-*` directory even though the
+run id is unchanged, so sync them in chronological order or the history interleaves.
+Online mode resumes seamlessly and is preferable wherever the host can reach wandb.ai —
+it already reaches the Hugging Face Hub.
+
+### Hyperparameter sweeps
+
+A sweep must give every trial its own `VIMD_OUTPUT_DIR`. Changing `VIMD_LR` while reusing
+one directory is caught by the recipe guard in §8 and the trial aborts immediately —
+correctly, since those checkpoints belong to a different experiment. Budget disk
+accordingly: each trial retains up to `VIMD_SAVE_TOTAL_LIMIT` checkpoints at ~19 GB.
+
+---
+
+## 11. Repository layout
 
 ```
+run.sh             entry point: install, then train
 main.py            the entire pipeline, self-contained
 requirements.txt   pinned dependencies
 README.MD          this file
+.gitignore         the runtime directories below, which must never be committed
 data/              created at runtime: the 16 kHz cache
 outputs/           created at runtime: models, metrics, predictions, logs
 ```
@@ -550,7 +654,7 @@ upload or a Python path surprise on the training server.
 
 ---
 
-## 11. Citation
+## 12. Citation
 
 ViMD — Nguyen et al., *Multi-Dialect Vietnamese: Task, Dataset, Baseline Models and Challenges*,
 EMNLP 2024. PhoWhisper — Le et al., *PhoWhisper: Automatic Speech Recognition for Vietnamese*,
