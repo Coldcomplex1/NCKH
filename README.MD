@@ -46,7 +46,7 @@ message rather than interleaving writes.
 
 | | |
 |---|---|
-| OS / arch | Linux x86_64 |
+| OS / arch | Linux x86_64. **Not native Windows**: `main.py` needs `fcntl` for its output-directory lock, which Windows has no equivalent of — it is the only non-portable thing in the file. WSL2 works, and the Windows NVIDIA driver provides CUDA inside it, so the GPU is still used; see below. |
 | Python | **3.10 – 3.12** recommended; 3.9 and 3.13 also resolve. **3.14+ does not**: torch 2.5.1 publishes no wheel above cp313, so `requirements.txt` cannot be installed on it. `run.sh` and `selfcheck.py` check this and say so. |
 | GPU | one NVIDIA GPU with ≥ 80 GB VRAM (A100 80 GB / H100) |
 | CUDA | driver reporting CUDA 12.2; `torch==2.5.1+cu121` |
@@ -58,6 +58,25 @@ Disk budget: ~12 GB for the 16 kHz audio cache, ~19 GB per retained training che
 by default), 6.2 GB for the selected model, 6.2 GB for the Hub model cache. The raw 59.8 GB of
 parquet is **never** all on disk at once — shards are downloaded, converted and deleted one at a
 time, so peak raw usage is about one shard (~0.5 GB).
+
+### Running from Windows
+
+Use WSL2 rather than PowerShell. `run.sh` is a shell script and `main.py` imports `fcntl`, so
+neither works on native Windows; both stop with a message saying so rather than failing obscurely.
+
+```powershell
+wsl --install -d Ubuntu          # PowerShell as Administrator, once; then reboot if asked
+```
+
+Then, in the Ubuntu shell, confirm the GPU is visible before anything else — the Windows NVIDIA
+driver supplies CUDA to WSL2, so nothing extra is installed inside Linux:
+
+```bash
+nvidia-smi
+```
+
+Clone into the Linux filesystem rather than working under `/mnt/c`. The pipeline writes a ~12 GB
+cache and ~19 GB checkpoints, and `/mnt/c` is slow enough for that to matter.
 
 Both `pip` steps must come from the pinned `requirements.txt`. In particular `transformers` is held
 at **4.51.3**: from 4.52 onward transformers refuses to `torch.load` a `pytorch_model.bin` unless

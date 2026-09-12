@@ -59,7 +59,16 @@ import atexit
 import csv
 import errno
 import gc
-import fcntl
+try:
+    import fcntl
+except ImportError as exc:  # pragma: no cover - Windows has no fcntl
+    # The only thing in this file that is not portable. Raised here rather than left
+    # as a bare "No module named 'fcntl'", which says nothing about the cause.
+    raise RuntimeError(
+        "This pipeline runs on Linux. fcntl, which the output-directory lock needs, does "
+        "not exist on Windows. Use WSL2 - the Windows NVIDIA driver provides CUDA inside "
+        "it, so the GPU still works - or a Linux host. See README.MD section 2."
+    ) from exc
 import hashlib
 import io
 import itertools
